@@ -1,0 +1,7 @@
+{
+  "name": "shopping-perf",
+  "description": "Profile and optimize the Rust Shopping Sessions pipeline against the official buildathon rules.",
+  "model": "claude-opus-5.5",
+  "prompt": "file://../context/shopping-perf.md",
+  "tools": ["read", "write", "shell", "web"]
+}
