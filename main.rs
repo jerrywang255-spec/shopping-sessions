@@ -514,16 +514,29 @@ fn dec_key(k: u64, out: &mut Vec<u8>) {
 }
 
 /// Interner for IDs that do not fit the compact encoding (rare).
-// Nine-byte ASCII keys retain their byte-wise order in this range.
+// ASCII keys of up to nine bytes retain their byte-wise order in this range,
+// which lets them skip the mutex-guarded interner even when they contain
+// characters outside the compact alphabet (e.g. the '_' in u_/cl_/link ids).
+// Byte 0 in [16,128) puts the packed value in [1<<60, 1<<63), disjoint from
+// both the compact enc_key range (< 1<<60) and the EXOTIC range (1<<63).
 #[inline(always)]
 fn ascii9(id: &[u8]) -> Option<u64> {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    if id.len() == 9 && (16..128).contains(&id[0]) {
-        let tail = u64::from_be_bytes(id[1..].try_into().unwrap());
-        const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
-        if tail & !ASCII == 0 {
-            let suffix = unsafe { std::arch::x86_64::_pext_u64(tail, ASCII) };
-            return Some((u64::from(id[0]) << 56) | suffix);
+    {
+        let n = id.len();
+        if (1..=9).contains(&n) && (16..128).contains(&id[0]) {
+            // Load nine bytes big-endian, zero-padding the absent low bytes so
+            // a shorter string sorts before a longer one sharing its prefix.
+            let mut buf = [0u8; 9];
+            buf[..n].copy_from_slice(id);
+            let tail = u64::from_be_bytes(buf[1..].try_into().unwrap());
+            const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+            // Reject any byte with the high bit set (non-7-bit ASCII).
+            let head_ok = u64::from(buf[0]) < 128;
+            if head_ok && tail & !ASCII == 0 {
+                let suffix = unsafe { std::arch::x86_64::_pext_u64(tail, ASCII) };
+                return Some((u64::from(buf[0]) << 56) | suffix);
+            }
         }
     }
     None
@@ -562,8 +575,14 @@ impl Exotic {
             let g = self.inner.lock().unwrap();
             out.extend_from_slice(&g.1[(k & !EXOTIC) as usize]);
         } else if k >= 1 << 60 {
+            // ascii9 pack: nine 7-bit big-endian lanes, zero-padded on the
+            // right for ids shorter than nine bytes. Stop at the first pad.
             for i in (0..9).rev() {
-                out.push(((k >> (7 * i)) & 0x7f) as u8);
+                let c = ((k >> (7 * i)) & 0x7f) as u8;
+                if c == 0 {
+                    break;
+                }
+                out.push(c);
             }
         } else {
             dec_key(k, out);
