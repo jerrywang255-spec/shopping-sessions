@@ -764,9 +764,53 @@ const D06: u64 = 0x0606_0606_0606_0606;
 const DF0: u64 = 0xF0F0_F0F0_F0F0_F0F0;
 
 /// Fast timestamp parser (same results as `parse_ts`).
+// Reduce eight little-endian digit lanes to one decimal integer.
+#[inline(always)]
+fn decimal8(digits: u64) -> u32 {
+    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let quads = (pairs * 100 + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    (quads as u32) * 10_000 + (quads >> 32) as u32
+}
+
+#[inline(always)]
+fn epoch13(s: &[u8]) -> Option<i64> {
+    // Two overlapping loads stay within the field. Left-pad the five trailing
+    // digits with three zero lanes so both groups use the same reduction.
+    let a = u64::from_le_bytes(s[..8].try_into().unwrap()) ^ D30;
+    let b = (u64::from_le_bytes(s[5..13].try_into().unwrap()) ^ D30) & 0xffff_ffff_ff00_0000;
+    if (a | b | a.wrapping_add(D06) | b.wrapping_add(D06)) & DF0 != 0 {
+        return None;
+    }
+    Some(i64::from(decimal8(a)) * 100_000 + i64::from(decimal8(b)))
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::epoch13;
+
+    #[test]
+    fn decimal_timestamp_matches_scalar_parsing() {
+        for sample in [b"0000000000000", b"0123456789012", b"9999999999999"] {
+            for position in 0..sample.len() {
+                for byte in 0..=255 {
+                    let mut input = *sample;
+                    input[position] = byte;
+                    let expected = input.iter().all(u8::is_ascii_digit).then(|| {
+                        input.iter().fold(0i64, |n, &c| n * 10 + i64::from(c - b'0'))
+                    });
+                    assert_eq!(epoch13(&input), expected, "{input:?}");
+                }
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn parse_ts_fast(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = s.len();
+    if n == 13 {
+        return epoch13(s);
+    }
     if (n == 20 || n == 25) && s[4] == b'-' {
         let k1 = u64::from_le_bytes(s[0..8].try_into().unwrap());
         let k2 = u16::from_le_bytes(s[8..10].try_into().unwrap());
