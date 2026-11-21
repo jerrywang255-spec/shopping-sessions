@@ -7,7 +7,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -401,7 +401,7 @@ fn arena(bytes: usize) -> *mut u8 {
             panic!("mmap failed");
         }
         madvise(p, bytes, 14); // MADV_HUGEPAGE
-        madvise(p, bytes, 23); // MADV_POPULATE_WRITE (ignored if unsupported)
+        if std::env::var_os("SS_PREFAULT").is_some() { madvise(p, bytes, 23); }
         p
     }
 }
@@ -1192,7 +1192,19 @@ fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
     });
 }
 
-fn parse_clicks(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, e: usize, out: &mut Parts<CRec>) {
+
+fn parse_links(ex: &Exotic, m: &[u8], b: usize, e: usize, out: &mut Vec<(u64, u64)>) {
+    let lim = m.as_ptr() as usize + m.len();
+    scan_lines::<2>(m, b, e, &mut |f: &[&[u8]; 2]| {
+        if f[0].is_empty() || f[1].is_empty() {
+            return;
+        }
+        out.push((ex.key_in(f[0], lim), ex.key_in(f[1], lim)));
+    });
+}
+
+// ------------------------------------------------------------------ stage 2: dedup
+fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &[u8], b: usize, e: usize, out: &mut Parts<CRec>) {
     let base = ctx.base;
     let hi = ctx.we;
     let lim = m.as_ptr() as usize + m.len();
@@ -1209,23 +1221,12 @@ fn parse_clicks(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
             None => return,
         };
         let cid = ex.key_in(f[0], lim);
-        let user = ex.key_in(f[1], lim);
-        out.push(part2(user), CRec { person: user, cid, ts: (ts - base) as u32, camp });
+        let person = lm.get(ex.key_in(f[1], lim));
+        out.push(part2(person), CRec { person, cid, ts: (ts - base) as u32, camp });
     });
 }
 
-fn parse_links(ex: &Exotic, m: &[u8], b: usize, e: usize, out: &mut Vec<(u64, u64)>) {
-    let lim = m.as_ptr() as usize + m.len();
-    scan_lines::<2>(m, b, e, &mut |f: &[&[u8]; 2]| {
-        if f[0].is_empty() || f[1].is_empty() {
-            return;
-        }
-        out.push((ex.key_in(f[0], lim), ex.key_in(f[1], lim)));
-    });
-}
-
-// ------------------------------------------------------------------ stage 2: dedup
-fn dedup_partition(parts: &[Parts<EvRec>], p: usize, buf: &mut Vec<EvRec>, table: &mut Vec<u32>, out: &mut Parts<PRec>) {
+fn dedup_direct(lm: &LinkMap, parts: &[Parts<EvRec>], p: usize, buf: &mut Vec<EvRec>, table: &mut Vec<u32>, out: &mut Parts<PRec>) {
     buf.clear();
     for t in parts {
         buf.extend_from_slice(t.main(p));
@@ -1264,27 +1265,13 @@ fn dedup_partition(parts: &[Parts<EvRec>], p: usize, buf: &mut Vec<EvRec>, table
         if j != u32::MAX {
             let r = &buf[j as usize];
             if r.ok != 0 {
-                out.push(part2(r.user), PRec { person: r.user, ts: r.ts, pc: r.pc });
+                let person = lm.get(r.user);
+                out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
             }
         }
     }
 }
 
-// ------------------------------------------------------------------ stage 3: users -> persons
-fn map_partition(lm: &LinkMap, evs: &[Parts<PRec>], cls: &[Parts<CRec>], p: usize, eout: &mut Parts<PRec>, cout: &mut Parts<CRec>) {
-    for t in evs {
-        t.each(p, |r| {
-            let person = lm.get(r.person);
-            eout.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
-        });
-    }
-    for t in cls {
-        t.each(p, |r| {
-            let person = lm.get(r.person);
-            cout.push(part2(person), CRec { person, ..*r });
-        });
-    }
-}
 
 // ------------------------------------------------------------------ stage 4: sessions
 struct Agg {
@@ -1315,6 +1302,7 @@ struct Scratch {
     citems: Vec<CItem>,
     ses: Vec<Ses>,
     cbuf: Vec<(u32, u32)>,
+    ctmp: Vec<(u32, u32)>,
     catrev: Vec<u64>,
     day_end: Vec<usize>,
 }
@@ -1435,7 +1423,20 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
     for l in 0..np {
         let (a, b) = (sc.ccnt[l] as usize, sc.ccnt[l + 1] as usize);
         if b - a > 1 {
-            sc.citems[a..b].sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| ex.cmp(x.cid, y.cid)));
+            let group = &mut sc.citems[a..b];
+            group.sort_unstable_by_key(|x| x.ts);
+            let mut i = 0;
+            while i < group.len() {
+                let ts = group[i].ts;
+                let mut end = i + 1;
+                let mut best = i;
+                while end < group.len() && group[end].ts == ts {
+                    if ex.cmp(group[end].cid, group[best].cid) == Ordering::Less { best = end; }
+                    end += 1;
+                }
+                group.swap(i, best);
+                i = end;
+            }
         }
     }
 
@@ -1529,7 +1530,8 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
             let cbuf = &mut sc.cbuf;
             cbuf.clear();
             cbuf.extend(clicks.iter().map(|c| (c.camp, c.ts)));
-            cbuf.sort_unstable();
+            if cbuf.len() <= 32 { cbuf.sort_unstable(); }
+            else { stable_campaign_group(cbuf, &mut sc.ctmp); }
             let mut a = 0usize;
             while a < cbuf.len() {
                 let camp = cbuf[a].0 as usize;
@@ -1554,6 +1556,29 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
                 a = b;
             }
         }
+    }
+}
+
+/// Stable two-pass LSD radix grouping by 16-bit campaign number.
+/// Clicks are already timestamp-ordered; stable grouping preserves that ordering.
+fn stable_campaign_group(buf: &mut Vec<(u32,u32)>, tmp: &mut Vec<(u32,u32)>) {
+    let n = buf.len();
+    tmp.resize(n, (0, 0));
+    let mut count = [0usize; 256];
+    for &(c,_) in buf.iter() { count[(c & 255) as usize] += 1; }
+    let mut pos = 0;
+    for k in count.iter_mut() { let c=*k; *k=pos; pos+=c; }
+    for &r in buf.iter() {
+        let k=(r.0 & 255) as usize;
+        tmp[count[k]]=r; count[k]+=1;
+    }
+    count.fill(0);
+    for &(c,_) in tmp.iter() { count[((c>>8)&255) as usize]+=1; }
+    pos=0;
+    for k in count.iter_mut() { let c=*k; *k=pos; pos+=c; }
+    for &r in tmp.iter() {
+        let k=((r.0>>8)&255) as usize;
+        buf[count[k]]=r; count[k]+=1;
     }
 }
 
@@ -1625,23 +1650,14 @@ fn write_user_daily(path: &Path, rows: &[URow], ex: &Exotic, cats: &[Vec<u8>]) {
 fn main() {
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    let nthreads: usize = std::env::var("NCPU")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
-        .max(1);
+    let nthreads = std::env::var("NCPU").ok().and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
     let timing = std::env::var("SS_TIMING").is_ok();
     let t0 = std::time::Instant::now();
-    let tick = |what: &str| {
-        if timing {
-            eprintln!("{:8.1} ms  {}", t0.elapsed().as_secs_f64() * 1000.0, what);
-        }
+    let tick = |label: &str| {
+        if timing { eprintln!("{:8.1} ms  {}", t0.elapsed().as_secs_f64()*1000.0, label); }
     };
-
-    if let Ok(mode) = std::env::var("BENCH") {
-        bench(&data, &mode);
-        return;
-    }
+    if let Ok(mode) = std::env::var("BENCH") { bench(&data, &mode); return; }
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_value(&manifest, "window_start");
     let we = manifest_value(&manifest, "window_end");
@@ -1649,171 +1665,94 @@ fn main() {
     assert!(we - base < u32::MAX as i64 && we > ws);
     let day0 = floor_div(ws, DAY_MS);
     let nd = (floor_div(we - 1, DAY_MS) - day0 + 1) as usize;
-
-    // products / categories
     let prod_rows = read_pairs(&data.join("products.csv"));
     let mut cats: Vec<Vec<u8>> = prod_rows.iter().map(|(_, c)| c.clone()).collect();
     cats.push(b"unknown".to_vec());
-    cats.sort();
-    cats.dedup();
+    cats.sort(); cats.dedup();
     assert!(cats.len() < 256);
-    let cat_idx: HashMap<Vec<u8>, u16> = cats.iter().enumerate().map(|(i, c)| (c.clone(), i as u16)).collect();
+    let cat_idx: HashMap<Vec<u8>,u16> = cats.iter().enumerate().map(|(i,c)|(c.clone(),i as u16)).collect();
     let mut prods = Lookup::new(b"p");
-    for (p, c) in &prod_rows {
-        prods.insert(p, cat_idx[c]);
-    }
+    for (p,c) in &prod_rows { prods.insert(p,cat_idx[c]); }
     let unknown_cat = cat_idx[&b"unknown".to_vec()] as u32;
-    // campaigns
     let camp_rows = read_pairs(&data.join("campaigns.csv"));
     let mut camps = Lookup::new(b"c_");
-    for (i, (c, _)) in camp_rows.iter().enumerate() {
-        camps.insert(c, i as u16);
-    }
+    for (i,(c,_)) in camp_rows.iter().enumerate() { camps.insert(c,i as u16); }
     let ncamp = camp_rows.len();
     let ctx = Ctx { base, ws, we, day0, nd, ncat: cats.len(), ncamp, prods, camps, unknown_cat };
     let ex = Exotic::new();
-
     let ev_maps: Vec<&[u8]> = csv_files(&data.join("events")).iter().map(|p| map_file(p)).collect();
     let cl_maps: Vec<&[u8]> = csv_files(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
     let ln_maps: Vec<&[u8]> = csv_files(&data.join("links")).iter().map(|p| map_file(p)).collect();
     let ev_chunks = make_chunks(&ev_maps, 4 << 20);
     let cl_chunks = make_chunks(&cl_maps, 4 << 20);
     let ln_chunks = make_chunks(&ln_maps, 1 << 20);
-    let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
-    let cl_bytes: usize = cl_maps.iter().map(|m| m.len()).sum();
+    let ev_bytes: usize = ev_maps.iter().map(|m|m.len()).sum();
+    let cl_bytes: usize = cl_maps.iter().map(|m|m.len()).sum();
     tick("setup");
-
-    // ---------------- stage 1: parse links, events, clicks
     let ln_next = AtomicUsize::new(0);
-    let ln_done = AtomicUsize::new(0);
+    let link_pairs: Vec<Vec<(u64,u64)>> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..nthreads).map(|_| s.spawn(|| {
+            let mut links = Vec::new();
+            loop {
+                let k = ln_next.fetch_add(1, AO::Relaxed);
+                if k >= ln_chunks.len() { break; }
+                let (fi,b,e) = ln_chunks[k];
+                parse_links(&ex, ln_maps[fi], b, e, &mut links);
+            }
+            links
+        })).collect();
+        hs.into_iter().map(|h|h.join().unwrap()).collect()
+    });
+    let lm = build_linkmap(&link_pairs, &ex);
+    drop(link_pairs);
+    tick("linked IDs");
     let ev_next = AtomicUsize::new(0);
     let cl_next = AtomicUsize::new(0);
-    let link_pairs: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
-    let linkmap: OnceLock<LinkMap> = OnceLock::new();
     let est_ev = ev_bytes / 80 + 1024;
     let est_cl = cl_bytes / 40 + 1024;
     let ev_cap = est_ev * 5 / 4 / nthreads / P1 + 32;
     let cl_cap = est_cl * 5 / 4 / nthreads / P2 + 32;
     let pr_cap = est_ev * 5 / 4 / nthreads / P2 + 32;
-    let ev_bytes_t = ev_cap * P1 * std::mem::size_of::<EvRec>();
-    let pe_bytes_t = pr_cap * P2 * std::mem::size_of::<PRec>();
-    let pc_bytes_t = cl_cap * P2 * std::mem::size_of::<CRec>();
-    let a_bytes = ev_bytes_t.max(pe_bytes_t + pc_bytes_t);
-    let stage1: Vec<(Parts<EvRec>, Parts<CRec>, usize)> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mem = arena(a_bytes);
-                    let mut evp: Parts<EvRec> = Parts::new(mem, ev_bytes_t, P1);
-                    let mut clp: Parts<CRec> = Parts::alloc(cl_cap, P2);
-                    let mut dc = DateCache::new();
-                    loop {
-                        let k = ln_next.fetch_add(1, AO::Relaxed);
-                        if k >= ln_chunks.len() {
-                            break;
-                        }
-                        let (fi, b, e) = ln_chunks[k];
-                        let mut v = Vec::new();
-                        parse_links(&ex, ln_maps[fi], b, e, &mut v);
-                        link_pairs.lock().unwrap().push(v);
-                        if ln_done.fetch_add(1, AO::AcqRel) + 1 == ln_chunks.len() {
-                            let pairs = std::mem::take(&mut *link_pairs.lock().unwrap());
-                            let tu = std::time::Instant::now();
-                            let _ = linkmap.set(build_linkmap(&pairs, &ex));
-                            if timing {
-                                eprintln!("  linkmap build {:?} pairs={} at {:?}", tu.elapsed(), pairs.iter().map(|v| v.len()).sum::<usize>(), t0.elapsed());
-                            }
-                        }
-                    }
-                    if ln_chunks.is_empty() {
-                        let _ = linkmap.set(LinkMap::empty());
-                    }
-                    loop {
-                        let k = ev_next.fetch_add(1, AO::Relaxed);
-                        if k >= ev_chunks.len() {
-                            break;
-                        }
-                        let (fi, b, e) = ev_chunks[k];
-                        parse_events(&ctx, &ex, &mut dc, ev_maps[fi], b, e, &mut evp);
-                    }
-                    loop {
-                        let k = cl_next.fetch_add(1, AO::Relaxed);
-                        if k >= cl_chunks.len() {
-                            break;
-                        }
-                        let (fi, b, e) = cl_chunks[k];
-                        parse_clicks(&ctx, &ex, &mut dc, cl_maps[fi], b, e, &mut clp);
-                    }
-                    (evp, clp, mem as usize)
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    let parsed: Vec<(Parts<EvRec>,Parts<CRec>)> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..nthreads).map(|_| s.spawn(|| {
+            let mut evp = Parts::<EvRec>::alloc(ev_cap, P1);
+            let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
+            let mut dc = DateCache::new();
+            loop {
+                let k = ev_next.fetch_add(1, AO::Relaxed);
+                if k >= ev_chunks.len() { break; }
+                let (fi,b,e) = ev_chunks[k];
+                parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
+            }
+            loop {
+                let k = cl_next.fetch_add(1, AO::Relaxed);
+                if k >= cl_chunks.len() { break; }
+                let (fi,b,e) = cl_chunks[k];
+                parse_clicks_direct(&ctx,&ex,&lm,&mut dc,cl_maps[fi],b,e,&mut clp);
+            }
+            (evp,clp)
+        })).collect();
+        hs.into_iter().map(|h|h.join().unwrap()).collect()
     });
-    let lm = linkmap.get().unwrap();
-    let mut ev_parts = Vec::new();
-    let mut cl_parts = Vec::new();
-    let mut mems = Vec::new();
-    for (a, b, c) in stage1 {
-        ev_parts.push(a);
-        cl_parts.push(b);
-        mems.push(c);
-    }
-    tick("stage1 parse");
-
-    // ---------------- stage 2: dedup events (eid partitions -> user partitions)
+    let (ev_parts,pc_parts):(Vec<_>,Vec<_>)=parsed.into_iter().unzip();
+    tick("parse, identity-aware clicks");
     let p_next = AtomicUsize::new(0);
-    let stage2: Vec<Parts<PRec>> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut out: Parts<PRec> = Parts::alloc(pr_cap, P2);
-                    let mut buf = Vec::new();
-                    let mut table = Vec::new();
-                    loop {
-                        let p = p_next.fetch_add(1, AO::Relaxed);
-                        if p >= P1 {
-                            break;
-                        }
-                        dedup_partition(&ev_parts, p, &mut buf, &mut table, &mut out);
-                    }
-                    out
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    let pe_parts: Vec<Parts<PRec>> = std::thread::scope(|s| {
+        let hs:Vec<_> = (0..nthreads).map(|_|s.spawn(|| {
+            let mut out = Parts::<PRec>::alloc(pr_cap,P2);
+            let mut buf = Vec::new();
+            let mut table = Vec::new();
+            loop {
+                let p=p_next.fetch_add(1,AO::Relaxed);
+                if p >= P1 {break;}
+                dedup_direct(&lm,&ev_parts,p,&mut buf,&mut table,&mut out);
+            }
+            out
+        })).collect();
+        hs.into_iter().map(|h|h.join().unwrap()).collect()
     });
     drop(ev_parts);
-    tick("stage2 dedup");
-
-    // ---------------- stage 3: users -> persons (user partitions -> person partitions)
-    let m_next = AtomicUsize::new(0);
-    let stage3: Vec<(Parts<PRec>, Parts<CRec>)> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|t| {
-                let mem = mems[t] as *mut u8 as usize;
-                let stage2 = &stage2;
-                let cl_parts = &cl_parts;
-                let m_next = &m_next;
-                s.spawn(move || {
-                    let mem = mem as *mut u8;
-                    let mut eout: Parts<PRec> = Parts::new(mem, pe_bytes_t, P2);
-                    let mut cout: Parts<CRec> = Parts::new(unsafe { mem.add(pe_bytes_t) }, pc_bytes_t, P2);
-                    loop {
-                        let p = m_next.fetch_add(1, AO::Relaxed);
-                        if p >= P2 {
-                            break;
-                        }
-                        map_partition(lm, stage2, cl_parts, p, &mut eout, &mut cout);
-                    }
-                    (eout, cout)
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let (pe_parts, pc_parts): (Vec<_>, Vec<_>) = stage3.into_iter().unzip();
-    tick("stage3 map");
+    tick("dedup => final person shards");
 
     // ---------------- stage 4: sessions, attribution, aggregation, user output
     let ud_dir = outdir.join("user_daily");
