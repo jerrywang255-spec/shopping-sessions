@@ -1,7 +1,7 @@
 name: Validate V3 Rust build
 on:
   push:
-    branches: ["optimization/v3"]
+    branches: ["main", "optimization/v3"]
   workflow_dispatch:
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
         run: python3 tests/smoke.py target/release/ss
       - name: Build original main baseline
         run: |
-          git fetch origin main --depth=1
+          git fetch origin fabf66e8d2b3864fe5e92098dec13b0eb30f5f0d --depth=1
           mkdir -p baseline/src
           git show FETCH_HEAD:Cargo.toml > baseline/Cargo.toml
           git show FETCH_HEAD:main.rs > baseline/src/main.rs
