@@ -2,3 +2,4 @@ target/
 out/
 dev/
 /.kiro/
+/best_main.rs

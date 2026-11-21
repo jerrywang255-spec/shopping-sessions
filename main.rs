@@ -406,6 +406,15 @@ fn arena(bytes: usize) -> *mut u8 {
     }
 }
 
+/// MADV_HUGEPAGE on the whole 4 KB pages inside an untouched heap buffer.
+fn advise_huge(p: *mut u8, len: usize) {
+    let start = (p as usize + 4095) & !4095;
+    let end = (p as usize + len) & !4095;
+    if end > start {
+        unsafe { madvise(start as *mut u8, end - start, 14) };
+    }
+}
+
 /// P partitions of fixed capacity inside one arena; overflow spills into Vecs.
 struct Parts<T: Copy> {
     base: *mut T,
@@ -600,6 +609,22 @@ unsafe fn enc_key16(s: &[u8]) -> Option<u64> {
 }
 
 impl Exotic {
+    // Event keys need equality only. Nine ASCII bytes fit in 63 bits, and a
+    // first byte >= 16 keeps these keys above the 60-bit compact alphabet.
+    #[inline(always)]
+    fn event_key(&self, id: &[u8], limit: usize) -> u64 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if id.len() == 9 && (16..128).contains(&id[0]) {
+            let tail = u64::from_le_bytes(id[1..].try_into().unwrap());
+            const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+            if tail & !ASCII == 0 {
+                let suffix = unsafe { std::arch::x86_64::_pext_u64(tail, ASCII) };
+                return (u64::from(id[0]) << 56) | suffix;
+            }
+        }
+        self.key_in(id, limit)
+    }
+
     /// Key for a field inside a buffer ending at `lim`.
     #[inline(always)]
     fn key_in(&self, s: &[u8], lim: usize) -> u64 {
@@ -1021,6 +1046,18 @@ impl LinkMap {
             i = (i + 1) & mask;
         }
     }
+    /// Start loading the first probe slot for `k` (dedup knows the next users ahead of time).
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if !self.slots.is_empty() {
+            let i = (hu(k) >> (64 - self.bits)) as usize;
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch::<_MM_HINT_T0>(self.slots.as_ptr().add(i) as *const i8);
+            }
+        }
+    }
 }
 
 fn build_linkmap(pairs: &[Vec<(u64, u64)>], ex: &Exotic) -> LinkMap {
@@ -1032,6 +1069,9 @@ fn build_linkmap(pairs: &[Vec<(u64, u64)>], ex: &Exotic) -> LinkMap {
     let bits = cap.trailing_zeros();
     let mask = cap - 1;
     let mut slots = vec![[0u64; 2]; cap];
+    // The zeroed buffer is still untouched: back it with huge pages like the arenas, because
+    // every event and click probes this table at random.
+    advise_huge(slots.as_mut_ptr() as *mut u8, cap * std::mem::size_of::<[u64; 2]>());
     let mut ukeys: Vec<u64> = Vec::with_capacity(total * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(total * 2);
     #[inline(always)]
@@ -1191,7 +1231,7 @@ fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
         if f[0].is_empty() {
             return;
         }
-        let eid = ex.key_in(f[0], lim);
+        let eid = ex.event_key(f[0], lim);
         let ingest_ms = parse_ts_fast(f[3], dc).unwrap_or(i64::MAX / 4);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
         let mut ok = !f[1].is_empty() && !f[5].is_empty();
@@ -1224,11 +1264,14 @@ fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
         }
         let rec = if ok {
             let user = ex.key_in(f[1], lim);
-            let cat = match ctx.prods.get(f[5]) {
-                Some(c) => c as u32,
-                None => ctx.unknown_cat,
+            // Only purchases contribute to category revenue.
+            let pc = if price == 0 {
+                0
+            } else {
+                let category = ctx.prods.get(f[5]).map(u32::from).unwrap_or(ctx.unknown_cat);
+                price | (category << 24)
             };
-            EvRec { eid, user, ts: (ts - base) as u32, ingest, pc: price | (cat << 24), ok: 1 }
+            EvRec { eid, user, ts: (ts - base) as u32, ingest, pc, ok: 1 }
         } else {
             EvRec { eid, user: 0, ts: 0, ingest, pc: 0, ok: 0 }
         };
@@ -1252,6 +1295,14 @@ fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache,
     let base = ctx.base;
     let hi = ctx.we;
     let lim = m.as_ptr() as usize + m.len();
+    // Identity lookups wait in a short FIFO so their table slots can be prefetched first.
+    const AHEAD: usize = 16;
+    let mut ring = [CRec { person: 0, cid: 0, ts: 0, camp: 0 }; AHEAD];
+    let mut queued = 0usize;
+    let mut resolve = |r: CRec, out: &mut Parts<CRec>| {
+        let person = lm.get(r.person);
+        out.push(part2(person), CRec { person, ..r });
+    };
     scan_lines::<4>(m, b, e, &mut |f: &[&[u8]; 4]| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -1265,46 +1316,98 @@ fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache,
             None => return,
         };
         let cid = ex.key_in(f[0], lim);
-        let person = lm.get(ex.key_in(f[1], lim));
-        out.push(part2(person), CRec { person, cid, ts: (ts - base) as u32, camp });
+        let user = ex.key_in(f[1], lim);
+        lm.prefetch(user);
+        let slot = queued % AHEAD;
+        if queued >= AHEAD {
+            resolve(ring[slot], out);
+        }
+        ring[slot] = CRec { person: user, cid, ts: (ts - base) as u32, camp };
+        queued += 1;
     });
+    for k in queued.saturating_sub(AHEAD)..queued {
+        resolve(ring[k % AHEAD], out);
+    }
 }
 
-fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, table: &mut Vec<Option<&'a EvRec>>, out: &mut Parts<PRec>) {
+#[derive(Default)]
+struct DedupScratch<'a> {
+    // Each word tracks 64 hash buckets. The second mask flags buckets visited twice.
+    buckets: Vec<[u64; 2]>,
+    winners: Vec<Option<&'a EvRec>>,
+}
+
+fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>) {
     let n: usize = parts.iter().map(|part| part.count(p)).sum();
     if n == 0 {
         return;
     }
-    let cap = (n * 2).next_power_of_two();
-    let mask = cap - 1;
-    table.clear();
-    table.resize(cap, None);
-    let shift = 64 - P1_BITS - (cap.trailing_zeros());
-    for r in parts.iter().flat_map(|part| part.main(p).iter().chain(&part.spill[p])) {
-        let h = r.eid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut s = ((h << P1_BITS) >> (P1_BITS + shift)) as usize & mask;
-        loop {
-            let Some(previous) = table[s] else {
-                table[s] = Some(r);
-                break;
-            };
-            if previous.eid == r.eid {
-                if r.ingest < previous.ingest {
-                    table[s] = Some(r);
-                }
-                break;
-            }
-            s = (s + 1) & mask;
-        }
+    let buckets = (n * 8).next_power_of_two().max(64);
+    scratch.buckets.clear();
+    scratch.buckets.resize(buckets / 64, [0, 0]);
+    let hash = |eid: u64| eid.wrapping_mul(0x9E37_79B9_7F4A_7C15) << P1_BITS;
+    let shift = 64 - buckets.trailing_zeros();
+    let records = || parts.iter().flat_map(|part| part.main(p).iter().chain(&part.spill[p]));
+    let mut collisions = 0usize;
+    for record in records() {
+        let index = (hash(record.eid) >> shift) as usize;
+        let bit = 1u64 << (index % 64);
+        let state = &mut scratch.buckets[index / 64];
+        let already_seen = state[0] & bit;
+        state[1] |= already_seen;
+        state[0] |= bit;
+        collisions += usize::from(already_seen != 0);
     }
-    for r in table.iter().flatten() {
+
+    // A bucket with k >= 2 records contributes k-1 collisions, so at most
+    // 2 * collisions records need exact deduplication. Leave the table half empty.
+    let capacity = (4 * collisions).next_power_of_two().max(2);
+    scratch.winners.clear();
+    scratch.winners.resize(capacity, None);
+    let table_shift = 64 - capacity.trailing_zeros();
+    let mut emit = |r: &EvRec| {
         if r.ok != 0 {
             let person = lm.get(r.user);
             out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
         }
+    };
+    // Identity lookups are random reads of a large table; prefetch a fixed distance ahead.
+    const AHEAD: usize = 16;
+    for part in parts {
+        for run in [part.main(p), &part.spill[p][..]] {
+            for (i, record) in run.iter().enumerate() {
+                if let Some(next) = run.get(i + AHEAD) {
+                    lm.prefetch(next.user);
+                }
+                let h = hash(record.eid);
+                let index = (h >> shift) as usize;
+                if scratch.buckets[index / 64][1] & (1u64 << (index % 64)) == 0 {
+                    emit(record);
+                    continue;
+                }
+                let mut slot = (h >> table_shift) as usize;
+                loop {
+                    match scratch.winners[slot] {
+                        None => {
+                            scratch.winners[slot] = Some(record);
+                            break;
+                        }
+                        Some(previous) if previous.eid == record.eid => {
+                            if record.ingest < previous.ingest {
+                                scratch.winners[slot] = Some(record);
+                            }
+                            break;
+                        }
+                        Some(_) => slot = (slot + 1) & (capacity - 1),
+                    }
+                }
+            }
+        }
+    }
+    for winner in scratch.winners.iter().flatten() {
+        emit(winner);
     }
 }
-
 
 // ------------------------------------------------------------------ stage 4: sessions
 struct Agg {
@@ -1400,8 +1503,28 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
     }
     for l in 0..np {
         let (a, b) = (sc.cnt[l] as usize, sc.cnt[l + 1] as usize);
-        if b - a > 1 {
-            sc.items[a..b].sort_unstable();
+        match b - a {
+            0 | 1 => {}
+            2 => {
+                if sc.items[a] > sc.items[a + 1] {
+                    sc.items.swap(a, a + 1);
+                }
+            }
+            3 => {
+                // sorting network for 3 elements (ascending u64 == ascending ts)
+                if sc.items[a] > sc.items[a + 1] {
+                    sc.items.swap(a, a + 1);
+                }
+                if sc.items[a + 1] > sc.items[a + 2] {
+                    sc.items.swap(a + 1, a + 2);
+                }
+                if sc.items[a] > sc.items[a + 1] {
+                    sc.items.swap(a, a + 1);
+                }
+            }
+            _ => {
+                sc.items[a..b].sort_unstable();
+            }
         }
     }
     // clicks grouped by the same local index (clicks of persons without events are useless)
@@ -1736,9 +1859,11 @@ fn main() {
         })).collect();
         hs.into_iter().map(|h|h.join().unwrap()).collect()
     });
-    let lm = build_linkmap(&link_pairs, &ex);
-    drop(link_pairs);
-    tick("linked IDs");
+    let lm = std::sync::LazyLock::new({
+        let ex = &ex;
+        move || build_linkmap(&link_pairs, ex)
+    });
+    tick("link rows parsed");
     let ev_next = AtomicUsize::new(0);
     let cl_next = AtomicUsize::new(0);
     let est_ev = ev_bytes / 80 + 1024;
@@ -1746,38 +1871,43 @@ fn main() {
     let ev_cap = est_ev * 5 / 4 / nthreads / P1 + 32;
     let cl_cap = est_cl * 5 / 4 / nthreads / P2 + 32;
     let pr_cap = est_ev * 5 / 4 / nthreads / P2 + 32;
-    let parsed: Vec<(Parts<EvRec>,Parts<CRec>)> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nthreads).map(|_| s.spawn(|| {
-            let mut evp = Parts::<EvRec>::alloc(ev_cap, P1);
-            let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
-            let mut dc = DateCache::new();
-            loop {
-                let k = ev_next.fetch_add(1, AO::Relaxed);
-                if k >= ev_chunks.len() { break; }
-                let (fi,b,e) = ev_chunks[k];
-                parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
-            }
-            loop {
-                let k = cl_next.fetch_add(1, AO::Relaxed);
-                if k >= cl_chunks.len() { break; }
-                let (fi,b,e) = cl_chunks[k];
-                parse_clicks_direct(&ctx,&ex,&lm,&mut dc,cl_maps[fi],b,e,&mut clp);
-            }
-            (evp,clp)
-        })).collect();
-        hs.into_iter().map(|h|h.join().unwrap()).collect()
+    let parse = || {
+        let mut evp = Parts::<EvRec>::alloc(ev_cap, P1);
+        let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
+        let mut dc = DateCache::new();
+        loop {
+            let k = ev_next.fetch_add(1, AO::Relaxed);
+            if k >= ev_chunks.len() { break; }
+            let (fi,b,e) = ev_chunks[k];
+            parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
+        }
+        let ids = std::sync::LazyLock::force(&lm);
+        loop {
+            let k = cl_next.fetch_add(1, AO::Relaxed);
+            if k >= cl_chunks.len() { break; }
+            let (fi,b,e) = cl_chunks[k];
+            parse_clicks_direct(&ctx,&ex,ids,&mut dc,cl_maps[fi],b,e,&mut clp);
+        }
+        (evp,clp)
+    };
+    let parsed: Vec<(Parts<EvRec>, Parts<CRec>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (1..nthreads).map(|_| scope.spawn(&parse)).collect();
+        // Other workers can parse events while the calling thread resolves identities.
+        std::sync::LazyLock::force(&lm);
+        std::iter::once(parse()).chain(workers.into_iter().map(|h| h.join().unwrap())).collect()
     });
+    let lm = std::sync::LazyLock::force(&lm);
     let (ev_parts,pc_parts):(Vec<_>,Vec<_>)=parsed.into_iter().unzip();
     tick("parse, identity-aware clicks");
     let p_next = AtomicUsize::new(0);
     let pe_parts: Vec<Parts<PRec>> = std::thread::scope(|s| {
         let hs:Vec<_> = (0..nthreads).map(|_|s.spawn(|| {
             let mut out = Parts::<PRec>::alloc(pr_cap,P2);
-            let mut table = Vec::new();
+            let mut scratch = DedupScratch::default();
             loop {
                 let p=p_next.fetch_add(1,AO::Relaxed);
                 if p >= P1 {break;}
-                dedup_direct(&lm,&ev_parts,p,&mut table,&mut out);
+                dedup_direct(lm,&ev_parts,p,&mut scratch,&mut out);
             }
             out
         })).collect();
@@ -1946,4 +2076,96 @@ fn bench(data: &Path, mode: &str) {
         }
     }
     eprintln!("{} {:?} cnt={} acc={}", mode, t.elapsed(), cnt, acc);
+}
+
+#[cfg(test)]
+mod event_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn event_keys_are_distinct_across_packed_and_fallback_encodings() {
+        let keys = Exotic::new();
+        let mut seen = HashMap::new();
+        let mut check = |id: &[u8]| {
+            let mut input = [0u8; 32];
+            input[..id.len()].copy_from_slice(id);
+            let field = &input[..id.len()];
+            let start = input.as_ptr() as usize;
+            let key = keys.event_key(field, start + input.len());
+            assert_eq!(key, keys.event_key(field, start + field.len()));
+            if let Some(previous) = seen.insert(key, id.to_vec()) {
+                assert_eq!(previous, id);
+            }
+        };
+        for len in 1..=12 {
+            check(&b"abcdefghijkl"[..len]);
+        }
+        for at in 0..9 {
+            for byte in 0..=255 {
+                let mut id = *b"e12345678";
+                id[at] = byte;
+                check(&id);
+            }
+        }
+    }
+
+    #[test]
+    fn colliding_event_ids_and_spilled_duplicates_keep_the_earliest_copy() {
+        // Put three distinct IDs in one 64-bucket filter slot and one in another.
+        let bucket = |key: u64| key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - P1_BITS - 6);
+        let ids: Vec<_> = (1u64..).filter(|&key| bucket(key) == 0).take(3).collect();
+        let singleton = (1u64..).find(|&key| bucket(key) == 1).unwrap();
+        let event = |eid, user, ingest, ok| EvRec { eid, user, ts: 1, ingest, pc: 0, ok };
+        let mut a = Parts::alloc(1, 1);
+        let mut b = Parts::alloc(1, 1);
+        a.push(0, event(ids[0], 11, 2, 1));
+        a.push(0, event(ids[1], 22, 5, 1));
+        a.push(0, event(singleton, 33, 1, 1));
+        b.push(0, event(ids[0], 44, 1, 1));
+        b.push(0, event(ids[1], 55, 3, 0));
+        b.push(0, event(ids[2], 66, 1, 1));
+        let inputs = [a, b];
+        let mut scratch = DedupScratch::default();
+        let mut out = Parts::alloc(1, P2);
+        dedup_direct(&LinkMap::empty(), &inputs, 0, &mut scratch, &mut out);
+        let mut users = Vec::new();
+        for p in 0..P2 {
+            out.each(p, |r| users.push(r.person));
+        }
+        users.sort_unstable();
+        assert_eq!(users, [33, 44, 66]);
+    }
+
+    #[test]
+    fn queued_click_lookups_keep_every_click_at_chunk_ends() {
+        // The identity prefetch queue holds 16 clicks; check sizes around it and a linked user.
+        let mut camps = Lookup::new(b"c_");
+        camps.insert(b"c_1", 0);
+        let ctx = Ctx { base: 0, ws: 0, we: i64::MAX / 4, day0: 0, nd: 1, ncat: 1, ncamp: 1,
+                        prods: Lookup::new(b"p"), camps, unknown_cat: 0 };
+        let keys = Exotic::new();
+        let lm = build_linkmap(&[vec![(enc_key(b"ua").unwrap(), enc_key(b"ub").unwrap())]], &keys);
+        for n in [0usize, 1, 15, 16, 17, 33] {
+            let mut csv = b"click_id,user_id,campaign_id,ts\n".to_vec();
+            for i in 0..n {
+                let user = if i % 3 == 0 { "ub" } else { "uc" };
+                csv.extend_from_slice(format!("k{i},{user},c_1,{}\n", 1000 + i).as_bytes());
+            }
+            let mut out = Parts::<CRec>::alloc(4, P2);
+            let mut dc = DateCache::new();
+            parse_clicks_direct(&ctx, &keys, &lm, &mut dc, &csv, 0, csv.len(), &mut out);
+            let mut got = Vec::new();
+            for p in 0..P2 {
+                out.each(p, |r| {
+                    assert_eq!(part2(r.person), p);
+                    got.push((r.ts, r.person));
+                });
+            }
+            got.sort_unstable();
+            let want: Vec<_> = (0..n)
+                .map(|i| (1000 + i as u32, enc_key(if i % 3 == 0 { b"ua" } else { b"uc" }).unwrap()))
+                .collect();
+            assert_eq!(got, want, "{n} clicks");
+        }
+    }
 }
