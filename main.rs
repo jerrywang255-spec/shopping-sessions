@@ -213,38 +213,42 @@ fn emit_line<'a, const N: usize>(m: &'a [u8], line_start: usize, ends: &[usize; 
     emit(&f);
 }
 
-/// Like `emit_line`, with the line's quote mask (bit i = byte line_start+i is a quote).
-#[inline(always)]
-fn emit_line_q<'a, const N: usize>(m: &'a [u8], ls: usize, ends: &[usize; N], q0: u64, q1: u64, emit: &mut impl FnMut(&[&'a [u8]; N])) {
-    let mut f: [&[u8]; N] = [&[]; N];
-    let mut s = ls;
-    if (q0 | q1) == 0 {
-        for k in 0..N {
-            let t = ends[k];
-            f[k] = unsafe { m.get_unchecked(s..t) };
-            s = t + 1;
-        }
-    } else {
-        let qm = (q0 as u128) | ((q1 as u128) << 64);
-        let mut expect: u128 = 0;
-        for k in 0..N {
-            let t = ends[k];
-            let rs = s - ls;
-            let rt = t - ls;
-            let q = (((qm >> rs) & 1) as usize) & ((t > s) as usize);
-            // a quoted field needs length >= 2; its closing quote is at rt-1
-            let qq = q & ((t >= s + 2) as usize);
-            expect |= ((qq as u128) << rs) | ((qq as u128) << (rt.wrapping_sub(1) & 127));
-            let a = s + qq;
-            let z = t - qq;
-            f[k] = unsafe { m.get_unchecked(a..z) };
-            s = t + 1;
-        }
-        if expect != qm {
-            return;
-        }
+/// Extract one quote flag per field from the delimiter masks. The opening and
+/// closing masks must describe the same fields; reject interior or lone quotes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn emit_masked_fields<'a, const N: usize>(
+    m: &'a [u8], start: usize, ends: &[usize; N], commas: u128, quotes: u128,
+    emit: &mut impl FnMut(&[&'a [u8]; N]),
+) {
+    use std::arch::x86_64::_pext_u64;
+    if quotes == 0 {
+        emit_line(m, start, ends, 0, emit);
+        return;
     }
-    emit(&f);
+    let boundaries = commas | (1u128 << (ends[N - 1] - start));
+    let starts = (commas << 1) | 1;
+    let lasts = boundaries >> 1;
+    if quotes & !(starts ^ lasts) != 0 {
+        return;
+    }
+    let extract = |bits: u128, mask: u128| {
+        let lo = mask as u64;
+        _pext_u64(bits as u64, lo)
+            | (_pext_u64((bits >> 64) as u64, (mask >> 64) as u64) << lo.count_ones())
+    };
+    let opened = extract(quotes, starts);
+    if opened != extract(quotes << 1, boundaries) {
+        return;
+    }
+    let mut fields: [&[u8]; N] = [&[]; N];
+    let mut left = start;
+    for (i, &right) in ends.iter().enumerate() {
+        let q = ((opened >> i) & 1) as usize;
+        fields[i] = m.get_unchecked(left + q..right - q);
+        left = right + 1;
+    }
+    emit(&fields);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -290,15 +294,16 @@ unsafe fn scan_lines_avx2<const N: usize>(m: &[u8], b: usize, e: usize, emit: &m
         }
         let pl = nm.trailing_zeros() as usize;
         let below = (1u128 << pl) - 1;
-        let mut cm = (mv(a0, vc) | (mv(a1, vc) << 32) | (mv(a2, vc) << 64) | (mv(a3, vc) << 96)) & below;
+        let cm = (mv(a0, vc) | (mv(a1, vc) << 32) | (mv(a2, vc) << 64) | (mv(a3, vc) << 96)) & below;
         if cm.count_ones() as usize == N - 1 {
+            let mut remaining = cm;
             for k in 0..N - 1 {
-                ends[k] = s + cm.trailing_zeros() as usize;
-                cm &= cm - 1;
+                ends[k] = s + remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
             }
             ends[N - 1] = s + pl;
             let qm = (mv(a0, vq) | (mv(a1, vq) << 32) | (mv(a2, vq) << 64) | (mv(a3, vq) << 96)) & below;
-            emit_line(m, s, &ends, qm.count_ones(), emit);
+            emit_masked_fields(m, s, &ends, cm, qm, emit);
         }
         s += pl + 1;
     }
@@ -372,7 +377,7 @@ unsafe fn scan_lines_avx512<const N: usize>(m: &[u8], b: usize, e: usize, emit: 
             ends[N - 1] = s + pl;
             let q0 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a0, vq), pl as u32);
             let q1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a1, vq), pl.saturating_sub(64) as u32);
-            emit_line(m, s, &ends, q0.count_ones() + q1.count_ones(), emit);
+            emit_masked_fields(m, s, &ends, (c0 as u128) | ((c1 as u128) << 64), (q0 as u128) | ((q1 as u128) << 64), emit);
         }
         s += pl + 1;
     }
