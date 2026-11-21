@@ -1,0 +1,51 @@
+name: Test duplicate filtering and a smaller identity map
+on:
+  push:
+    branches: ["optimization/v5-memory-loop"]
+  workflow_dispatch:
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [53, 97]
+    env:
+      SEED: ${{ matrix.seed }}
+      NCPU: 4
+      RUSTFLAGS: -C target-cpu=x86-64-v3
+      DATA_DIR: /tmp/shopping-benchmark
+      VARIANTS: "baseline singletons aliases"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Build and validate the exact binaries
+        run: |
+          python3 -m pip install --user pyarrow==23.0.0 polars
+          url=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for archive in starter-duckdb dev-answer generator; do
+            curl -fsSL --retry 3 "$url/$archive.zip" -o "/tmp/$archive.zip"
+            unzip -q "/tmp/$archive.zip" -d /tmp
+          done
+          cargo build --manifest-path /tmp/generator/Cargo.toml --release --offline
+          /tmp/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev-data
+          mkdir -p src variants
+          cp pq.rs src/
+          for pair in baseline=08f57654ab99d12328bdf3b73b8c5ee2316d0125 singletons=438a60e61897282e6fc91c658534e1fc644773a5 aliases=87b20b0920ba86721a478b1d248d9bb1ea2d7df8; do
+            name=${pair%%=*}
+            ref=${pair#*=}
+            git show "$ref:main.rs" > src/main.rs
+            cargo test --offline --quiet
+            cargo build --release --offline --quiet
+            cp target/release/ss "variants/$name"
+            python3 /tmp/starter-duckdb/scripts/run_fixtures.py /tmp/starter-duckdb/fixtures -- "variants/$name"
+            DATA_DIR=/tmp/dev-data OUTPUT_DIR="/tmp/dev-$name" "variants/$name"
+            python3 /tmp/starter-duckdb/scripts/compare.py "/tmp/dev-$name" /tmp/dev-answer
+          done
+      - name: Generate the held-out dataset
+        run: /tmp/generator/target/release/generate --seed "$SEED" --events 20000000 --clicks 5000000 --output "$DATA_DIR"
+      - name: Interleave runs and check every measured result
+        run: python3 experiments/v5_compare.py
