@@ -600,6 +600,22 @@ unsafe fn enc_key16(s: &[u8]) -> Option<u64> {
 }
 
 impl Exotic {
+    // Event keys need equality only. Nine ASCII bytes fit in 63 bits, and a
+    // first byte >= 16 keeps these keys above the 60-bit compact alphabet.
+    #[inline(always)]
+    fn event_key(&self, id: &[u8], limit: usize) -> u64 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if id.len() == 9 && (16..128).contains(&id[0]) {
+            let tail = u64::from_le_bytes(id[1..].try_into().unwrap());
+            const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+            if tail & !ASCII == 0 {
+                let suffix = unsafe { std::arch::x86_64::_pext_u64(tail, ASCII) };
+                return (u64::from(id[0]) << 56) | suffix;
+            }
+        }
+        self.key_in(id, limit)
+    }
+
     /// Key for a field inside a buffer ending at `lim`.
     #[inline(always)]
     fn key_in(&self, s: &[u8], lim: usize) -> u64 {
@@ -1191,7 +1207,7 @@ fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
         if f[0].is_empty() {
             return;
         }
-        let eid = ex.key_in(f[0], lim);
+        let eid = ex.event_key(f[0], lim);
         let ingest_ms = parse_ts_fast(f[3], dc).unwrap_or(i64::MAX / 4);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
         let mut ok = !f[1].is_empty() && !f[5].is_empty();
