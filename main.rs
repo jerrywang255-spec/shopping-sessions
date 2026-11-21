@@ -36,8 +36,27 @@ fn map_file(path: &Path) -> &'static [u8] {
             return Box::leak(v.into_boxed_slice());
         }
         madvise(p, len, 2); // MADV_SEQUENTIAL
+        MAPPED.lock().unwrap().push((p as usize, len));
         std::slice::from_raw_parts(p, len)
     }
+}
+
+/// Every input file mapping (never the read() fallback buffers).
+static MAPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Unmap all input files on a background thread. Tearing down ~2 GB of file PTEs costs
+/// tens of ms of kernel time; done at exit it would sit on the critical path.
+/// Callers must not touch any slice returned by `map_file` afterwards.
+fn unmap_inputs_in_background() {
+    extern "C" {
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+    }
+    let maps = std::mem::take(&mut *MAPPED.lock().unwrap());
+    std::thread::spawn(move || {
+        for (p, len) in maps {
+            unsafe { munmap(p as *mut u8, len) };
+        }
+    });
 }
 
 fn csv_files(dir: &Path) -> Vec<PathBuf> {
@@ -1964,6 +1983,9 @@ fn main() {
     });
     let lm = std::sync::LazyLock::force(&lm);
     let (ev_parts,pc_parts):(Vec<_>,Vec<_>)=parsed.into_iter().unzip();
+    // Records hold no references into the inputs (IDs are encoded or interned copies).
+    drop((ev_maps, cl_maps, ln_maps));
+    unmap_inputs_in_background();
     tick("parse, identity-aware clicks");
     let p_next = AtomicUsize::new(0);
     let pe_parts: Vec<Parts<PRec>> = std::thread::scope(|s| {
