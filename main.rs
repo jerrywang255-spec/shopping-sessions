@@ -149,6 +149,15 @@ fn fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
 /// starting in [b, e) (skipping the file's header line). Malformed lines are skipped.
 #[inline(always)]
 fn scan_lines<const N: usize>(m: &[u8], b: usize, e: usize, emit: &mut impl FnMut(&[&[u8]; N])) {
+    // Experiment only: compare a strictly-correct scalar delimiter parser
+    // with the AVX2/AVX512 scanner on the same input and CPU allocation.
+    if std::env::var_os("SS_SCALAR_CSV").is_some() {
+        for_lines(m, b, e, |line| {
+            let mut f: [&[u8]; N] = [&[]; N];
+            if fields(line, &mut f) { emit(&f); }
+        });
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("bmi2") {
@@ -1298,6 +1307,7 @@ struct Scratch {
     lidx: Vec<u32>,
     cnt: Vec<u32>,
     items: Vec<u64>,
+    radix_tmp: Vec<u64>,
     ccnt: Vec<u32>,
     citems: Vec<CItem>,
     ses: Vec<Ses>,
@@ -1365,10 +1375,15 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
             });
         }
     }
+    let use_radix_events = std::env::var_os("SS_RADIX_EVENTS").is_some();
     for l in 0..np {
         let (a, b) = (sc.cnt[l] as usize, sc.cnt[l + 1] as usize);
-        if b - a > 1 {
-            sc.items[a..b].sort_unstable();
+        if b-a>1 {
+            if use_radix_events && b-a >= 2048 {
+                radix_sort_event_times(&mut sc.items[a..b], &mut sc.radix_tmp);
+            } else {
+                sc.items[a..b].sort_unstable();
+            }
         }
     }
     // clicks grouped by the same local index (clicks of persons without events are useless)
@@ -1557,6 +1572,40 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
             }
         }
     }
+}
+
+/// Three stable 11-bit radix passes sort packed events by the 32-bit
+/// relative timestamp, not by the purchase/category payload.
+fn radix_sort_event_times(items: &mut [u64], scratch: &mut Vec<u64>) {
+    let n=items.len();
+    if n<2 {return;}
+    scratch.resize(n,0);
+    let mut count=[0usize; 2048];
+    for pass in 0..3 {
+        let shift=32 + pass*11;
+        count.fill(0);
+        if pass % 2 == 0 {
+            for &it in items.iter() { count[((it>>shift)&2047) as usize]+=1; }
+        } else {
+            for &it in scratch.iter() { count[((it>>shift)&2047) as usize]+=1; }
+        }
+        let mut offset=0;
+        for x in count.iter_mut() {let n=*x; *x=offset; offset+=n;}
+        if pass % 2 == 0 {
+            for &it in items.iter() {
+                let k=((it>>shift)&2047) as usize;
+                scratch[count[k]]=it;
+                count[k]+=1;
+            }
+        } else {
+            for &it in scratch.iter() {
+                let k=((it>>shift)&2047) as usize;
+                items[count[k]]=it;
+                count[k]+=1;
+            }
+        }
+    }
+    items.copy_from_slice(scratch);
 }
 
 /// Stable two-pass LSD radix grouping by 16-bit campaign number.
