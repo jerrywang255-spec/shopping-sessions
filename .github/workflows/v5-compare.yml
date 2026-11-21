@@ -1,0 +1,51 @@
+name: Measure purchase lookups and ASCII event keys against V4
+on:
+  push:
+    branches: ["optimization/v5-parse-loop"]
+  workflow_dispatch:
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [53, 97]
+    env:
+      SEED: ${{ matrix.seed }}
+      NCPU: 4
+      RUSTFLAGS: -C target-cpu=x86-64-v3
+      DATA_DIR: /tmp/shopping-benchmark
+      VARIANTS: "baseline purchase packed"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Build and validate the exact binaries
+        run: |
+          python3 -m pip install --user pyarrow==23.0.0 polars
+          url=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for archive in starter-duckdb dev-answer generator; do
+            curl -fsSL --retry 3 "$url/$archive.zip" -o "/tmp/$archive.zip"
+            unzip -q "/tmp/$archive.zip" -d /tmp
+          done
+          cargo build --manifest-path /tmp/generator/Cargo.toml --release --offline
+          /tmp/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev-data
+          mkdir -p src variants
+          cp pq.rs src/
+          for pair in baseline=955b2fb3375770633ddf5f5d58546daed3401ce1 purchase=7ccf8b1f90d70ac7fbb9f0c43bf4b28e4652a9ca packed=08f57654ab99d12328bdf3b73b8c5ee2316d0125; do
+            name=${pair%%=*}
+            ref=${pair#*=}
+            git show "$ref:main.rs" > src/main.rs
+            cargo test --offline --quiet
+            cargo build --release --offline --quiet
+            cp target/release/ss "variants/$name"
+            python3 /tmp/starter-duckdb/scripts/run_fixtures.py /tmp/starter-duckdb/fixtures -- "variants/$name"
+            DATA_DIR=/tmp/dev-data OUTPUT_DIR="/tmp/dev-$name" "variants/$name"
+            python3 /tmp/starter-duckdb/scripts/compare.py "/tmp/dev-$name" /tmp/dev-answer
+          done
+      - name: Generate the held-out dataset
+        run: /tmp/generator/target/release/generate --seed "$SEED" --events 20000000 --clicks 5000000 --output "$DATA_DIR"
+      - name: Interleave runs and check every measured result
+        run: python3 experiments/v5_compare.py
