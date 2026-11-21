@@ -1453,8 +1453,28 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
     }
     for l in 0..np {
         let (a, b) = (sc.cnt[l] as usize, sc.cnt[l + 1] as usize);
-        if b - a > 1 {
-            sc.items[a..b].sort_unstable();
+        match b - a {
+            0 | 1 => {}
+            2 => {
+                if sc.items[a] > sc.items[a + 1] {
+                    sc.items.swap(a, a + 1);
+                }
+            }
+            3 => {
+                // sorting network for 3 elements (ascending u64 == ascending ts)
+                if sc.items[a] > sc.items[a + 1] {
+                    sc.items.swap(a, a + 1);
+                }
+                if sc.items[a + 1] > sc.items[a + 2] {
+                    sc.items.swap(a + 1, a + 2);
+                }
+                if sc.items[a] > sc.items[a + 1] {
+                    sc.items.swap(a, a + 1);
+                }
+            }
+            _ => {
+                sc.items[a..b].sort_unstable();
+            }
         }
     }
     // clicks grouped by the same local index (clicks of persons without events are useless)
