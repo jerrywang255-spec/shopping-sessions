@@ -1100,11 +1100,27 @@ fn build_linkmap(pairs: &[Vec<(u64, u64)>], ex: &Exotic) -> LinkMap {
             minkey[r] = ukeys[i];
         }
     }
-    for s in slots.iter_mut() {
-        if s[0] != 0 {
-            let r = find(&mut parent, s[1] as u32) as usize;
-            s[1] = minkey[r];
+    // A canonical name resolves to itself even when absent from the lookup.
+    // Only other members need entries once all unions and names are final.
+    drop(slots);
+    let aliases = parent.iter().enumerate().filter(|&(i, &p)| i != p as usize).count();
+    if aliases == 0 {
+        return LinkMap::empty();
+    }
+    let cap = (2 * aliases).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let bits = cap.trailing_zeros();
+    let mut slots = vec![[0u64; 2]; cap];
+    for (i, key) in ukeys.into_iter().enumerate() {
+        let person = minkey[find(&mut parent, i as u32) as usize];
+        if key == person {
+            continue;
         }
+        let mut slot = (hu(key) >> (64 - bits)) as usize;
+        while slots[slot][0] != 0 {
+            slot = (slot + 1) & mask;
+        }
+        slots[slot] = [key, person];
     }
     LinkMap { slots, bits }
 }
