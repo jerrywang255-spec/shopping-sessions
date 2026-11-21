@@ -1789,9 +1789,11 @@ fn main() {
         })).collect();
         hs.into_iter().map(|h|h.join().unwrap()).collect()
     });
-    let lm = build_linkmap(&link_pairs, &ex);
-    drop(link_pairs);
-    tick("linked IDs");
+    let lm = std::sync::LazyLock::new({
+        let ex = &ex;
+        move || build_linkmap(&link_pairs, ex)
+    });
+    tick("link rows parsed");
     let ev_next = AtomicUsize::new(0);
     let cl_next = AtomicUsize::new(0);
     let est_ev = ev_bytes / 80 + 1024;
@@ -1799,27 +1801,32 @@ fn main() {
     let ev_cap = est_ev * 5 / 4 / nthreads / P1 + 32;
     let cl_cap = est_cl * 5 / 4 / nthreads / P2 + 32;
     let pr_cap = est_ev * 5 / 4 / nthreads / P2 + 32;
-    let parsed: Vec<(Parts<EvRec>,Parts<CRec>)> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nthreads).map(|_| s.spawn(|| {
-            let mut evp = Parts::<EvRec>::alloc(ev_cap, P1);
-            let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
-            let mut dc = DateCache::new();
-            loop {
-                let k = ev_next.fetch_add(1, AO::Relaxed);
-                if k >= ev_chunks.len() { break; }
-                let (fi,b,e) = ev_chunks[k];
-                parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
-            }
-            loop {
-                let k = cl_next.fetch_add(1, AO::Relaxed);
-                if k >= cl_chunks.len() { break; }
-                let (fi,b,e) = cl_chunks[k];
-                parse_clicks_direct(&ctx,&ex,&lm,&mut dc,cl_maps[fi],b,e,&mut clp);
-            }
-            (evp,clp)
-        })).collect();
-        hs.into_iter().map(|h|h.join().unwrap()).collect()
+    let parse = || {
+        let mut evp = Parts::<EvRec>::alloc(ev_cap, P1);
+        let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
+        let mut dc = DateCache::new();
+        loop {
+            let k = ev_next.fetch_add(1, AO::Relaxed);
+            if k >= ev_chunks.len() { break; }
+            let (fi,b,e) = ev_chunks[k];
+            parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
+        }
+        let ids = std::sync::LazyLock::force(&lm);
+        loop {
+            let k = cl_next.fetch_add(1, AO::Relaxed);
+            if k >= cl_chunks.len() { break; }
+            let (fi,b,e) = cl_chunks[k];
+            parse_clicks_direct(&ctx,&ex,ids,&mut dc,cl_maps[fi],b,e,&mut clp);
+        }
+        (evp,clp)
+    };
+    let parsed: Vec<(Parts<EvRec>, Parts<CRec>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (1..nthreads).map(|_| scope.spawn(&parse)).collect();
+        // Other workers can parse events while the calling thread resolves identities.
+        std::sync::LazyLock::force(&lm);
+        std::iter::once(parse()).chain(workers.into_iter().map(|h| h.join().unwrap())).collect()
     });
+    let lm = std::sync::LazyLock::force(&lm);
     let (ev_parts,pc_parts):(Vec<_>,Vec<_>)=parsed.into_iter().unzip();
     tick("parse, identity-aware clicks");
     let p_next = AtomicUsize::new(0);
@@ -1830,7 +1837,7 @@ fn main() {
             loop {
                 let p=p_next.fetch_add(1,AO::Relaxed);
                 if p >= P1 {break;}
-                dedup_direct(&lm,&ev_parts,p,&mut scratch,&mut out);
+                dedup_direct(lm,&ev_parts,p,&mut scratch,&mut out);
             }
             out
         })).collect();
