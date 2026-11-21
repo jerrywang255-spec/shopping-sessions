@@ -415,65 +415,127 @@ fn advise_huge(p: *mut u8, len: usize) {
     }
 }
 
-/// P partitions of fixed capacity inside one arena; overflow spills into Vecs.
+// Partitions are chains of 4 KB chunks carved from one shared huge-page arena, so only
+// memory that holds records is ever faulted in. Dedup recycles the event chunks it has
+// consumed for its own output, which therefore needs almost no fresh (zeroed) pages.
+const CHUNK: usize = 4096;
+const BLOCK: usize = 2 << 20;
+
+/// Shared bump allocator handing out 2 MB blocks of one big virtual reservation.
+struct Pool {
+    base: usize,
+    len: usize,
+    next: AtomicUsize,
+}
+impl Pool {
+    fn new(bytes: usize) -> Self {
+        let len = (bytes.max(BLOCK) + BLOCK - 1) & !(BLOCK - 1);
+        // Over-reserve one block so the usable range starts on a huge-page boundary.
+        let raw = arena(len + BLOCK) as usize;
+        Pool { base: (raw + BLOCK - 1) & !(BLOCK - 1), len, next: AtomicUsize::new(0) }
+    }
+    #[cold]
+    fn block(&self) -> (usize, usize) {
+        let off = self.next.fetch_add(BLOCK, AO::Relaxed);
+        if off + BLOCK <= self.len {
+            (self.base + off, BLOCK)
+        } else {
+            // Reservation exhausted (estimate too low): fall back to a private arena.
+            let n = 64 << 20;
+            (arena(n) as usize, n)
+        }
+    }
+}
+
+/// Per-thread chunk source: recycled chunks first, then fresh ones from the pool.
+struct Alloc<'a> {
+    pool: &'a Pool,
+    cur: usize,
+    end: usize,
+    free: Vec<usize>,
+}
+impl<'a> Alloc<'a> {
+    fn new(pool: &'a Pool) -> Self {
+        Alloc { pool, cur: 0, end: 0, free: Vec::new() }
+    }
+    #[inline]
+    fn chunk(&mut self) -> *mut u8 {
+        if let Some(c) = self.free.pop() {
+            return c as *mut u8;
+        }
+        if self.cur == self.end {
+            let (p, l) = self.pool.block();
+            self.cur = p;
+            self.end = p + l;
+        }
+        let c = self.cur;
+        self.cur += CHUNK;
+        c as *mut u8
+    }
+}
+
+/// P partitions, each a list of full chunks plus one partly filled current chunk.
 struct Parts<T: Copy> {
-    base: *mut T,
-    cap: usize,
-    len: Vec<u32>,
-    spill: Vec<Vec<T>>,
+    cur: Vec<(*mut T, u32)>,
+    full: Vec<Vec<*mut T>>,
 }
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
 unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 impl<T: Copy> Parts<T> {
-    fn new(mem: *mut u8, bytes: usize, np: usize) -> Self {
-        let cap = bytes / std::mem::size_of::<T>() / np;
-        Parts { base: mem as *mut T, cap, len: vec![0; np], spill: (0..np).map(|_| Vec::new()).collect() }
-    }
-    fn alloc(count_per_part: usize, np: usize) -> Self {
-        let bytes = count_per_part * np * std::mem::size_of::<T>();
-        Parts::new(arena(bytes), bytes, np)
+    const K: usize = CHUNK / std::mem::size_of::<T>();
+    fn new(np: usize) -> Self {
+        Parts { cur: vec![(std::ptr::null_mut(), Self::K as u32); np], full: (0..np).map(|_| Vec::new()).collect() }
     }
     #[inline(always)]
-    fn push(&mut self, p: usize, x: T) {
+    fn push(&mut self, a: &mut Alloc, p: usize, x: T) {
         unsafe {
-            let l = *self.len.get_unchecked(p) as usize;
-            if l < self.cap {
-                self.base.add(p * self.cap + l).write(x);
-                *self.len.get_unchecked_mut(p) = l as u32 + 1;
+            let slot = self.cur.get_unchecked_mut(p);
+            let (ptr, fill) = *slot;
+            if (fill as usize) < Self::K {
+                ptr.add(fill as usize).write(x);
+                slot.1 = fill + 1;
             } else {
-                self.spill.get_unchecked_mut(p).push(x);
+                self.push_new(a, p, x);
             }
         }
     }
+    #[inline(never)]
+    fn push_new(&mut self, a: &mut Alloc, p: usize, x: T) {
+        let (ptr, _) = self.cur[p];
+        if !ptr.is_null() {
+            self.full[p].push(ptr);
+        }
+        let c = a.chunk() as *mut T;
+        unsafe { c.write(x) };
+        self.cur[p] = (c, 1);
+    }
+    /// Record runs of partition p (each a chunk).
     #[inline(always)]
-    fn main(&self, p: usize) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.base.add(p * self.cap), self.len[p] as usize) }
+    fn runs(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
+        let (ptr, fill) = self.cur[p];
+        let last: &[T] = if ptr.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(ptr, fill as usize) } };
+        self.full[p].iter().map(|&c| unsafe { std::slice::from_raw_parts(c as *const T, Self::K) }).chain(std::iter::once(last))
+    }
+    /// Give partition p's chunks to `a` for reuse (the caller is done reading them).
+    fn release(&self, p: usize, a: &mut Alloc) {
+        a.free.extend(self.full[p].iter().map(|&c| c as usize));
+        let (ptr, _) = self.cur[p];
+        if !ptr.is_null() {
+            a.free.push(ptr as usize);
+        }
     }
     #[inline(always)]
     fn count(&self, p: usize) -> usize {
-        self.len[p] as usize + self.spill[p].len()
+        let (ptr, fill) = self.cur[p];
+        self.full[p].len() * Self::K + if ptr.is_null() { 0 } else { fill as usize }
     }
     #[inline(always)]
     fn each(&self, p: usize, mut f: impl FnMut(&T)) {
-        for x in self.main(p) {
-            f(x);
+        for run in self.runs(p) {
+            for x in run {
+                f(x);
+            }
         }
-        for x in &self.spill[p] {
-            f(x);
-        }
-    }
-    fn clear(&mut self) {
-        for l in self.len.iter_mut() {
-            *l = 0;
-        }
-        for v in self.spill.iter_mut() {
-            v.clear();
-        }
-    }
-    /// Reuse this arena's memory for another record type.
-    fn recycle<U: Copy>(self, np: usize) -> Parts<U> {
-        let bytes = self.cap * np * std::mem::size_of::<T>();
-        Parts::new(self.base as *mut u8, bytes, np)
     }
 }
 
@@ -1222,7 +1284,7 @@ fn parse_price(s: &[u8]) -> u32 {
     v as u32
 }
 
-fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, e: usize, out: &mut Parts<EvRec>) {
+fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, e: usize, out: &mut Parts<EvRec>, al: &mut Alloc) {
     let base = ctx.base;
     let lo = ctx.ws;
     let hi = ctx.we;
@@ -1275,7 +1337,7 @@ fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
         } else {
             EvRec { eid, user: 0, ts: 0, ingest, pc: 0, ok: 0 }
         };
-        out.push(part1(eid), rec);
+        out.push(al, part1(eid), rec);
     });
 }
 
@@ -1291,7 +1353,7 @@ fn parse_links(ex: &Exotic, m: &[u8], b: usize, e: usize, out: &mut Vec<(u64, u6
 }
 
 // ------------------------------------------------------------------ stage 2: dedup
-fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &[u8], b: usize, e: usize, out: &mut Parts<CRec>) {
+fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &[u8], b: usize, e: usize, out: &mut Parts<CRec>, al: &mut Alloc) {
     let base = ctx.base;
     let hi = ctx.we;
     let lim = m.as_ptr() as usize + m.len();
@@ -1301,7 +1363,7 @@ fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache,
     let mut queued = 0usize;
     let mut resolve = |r: CRec, out: &mut Parts<CRec>| {
         let person = lm.get(r.person);
-        out.push(part2(person), CRec { person, ..r });
+        out.push(al, part2(person), CRec { person, ..r });
     };
     scan_lines::<4>(m, b, e, &mut |f: &[&[u8]; 4]| {
         if f[0].is_empty() || f[1].is_empty() {
@@ -1337,7 +1399,7 @@ struct DedupScratch<'a> {
     winners: Vec<Option<&'a EvRec>>,
 }
 
-fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>) {
+fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>, al: &mut Alloc) {
     let n: usize = parts.iter().map(|part| part.count(p)).sum();
     if n == 0 {
         return;
@@ -1347,7 +1409,7 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: 
     scratch.buckets.resize(buckets / 64, [0, 0]);
     let hash = |eid: u64| eid.wrapping_mul(0x9E37_79B9_7F4A_7C15) << P1_BITS;
     let shift = 64 - buckets.trailing_zeros();
-    let records = || parts.iter().flat_map(|part| part.main(p).iter().chain(&part.spill[p]));
+    let records = || parts.iter().flat_map(|part| part.runs(p).flatten());
     let mut collisions = 0usize;
     for record in records() {
         let index = (hash(record.eid) >> shift) as usize;
@@ -1368,13 +1430,13 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: 
     let mut emit = |r: &EvRec| {
         if r.ok != 0 {
             let person = lm.get(r.user);
-            out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
+            out.push(al, part2(person), PRec { person, ts: r.ts, pc: r.pc });
         }
     };
     // Identity lookups are random reads of a large table; prefetch a fixed distance ahead.
     const AHEAD: usize = 16;
     for part in parts {
-        for run in [part.main(p), &part.spill[p][..]] {
+        for run in part.runs(p) {
             for (i, record) in run.iter().enumerate() {
                 if let Some(next) = run.get(i + AHEAD) {
                     lm.prefetch(next.user);
@@ -1407,6 +1469,8 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: 
     for winner in scratch.winners.iter().flatten() {
         emit(winner);
     }
+    // The caller recycles this partition's chunks next: drop every reference into them.
+    scratch.winners.clear();
 }
 
 // ------------------------------------------------------------------ stage 4: sessions
@@ -1866,27 +1930,29 @@ fn main() {
     tick("link rows parsed");
     let ev_next = AtomicUsize::new(0);
     let cl_next = AtomicUsize::new(0);
-    let est_ev = ev_bytes / 80 + 1024;
-    let est_cl = cl_bytes / 40 + 1024;
-    let ev_cap = est_ev * 5 / 4 / nthreads / P1 + 32;
-    let cl_cap = est_cl * 5 / 4 / nthreads / P2 + 32;
-    let pr_cap = est_ev * 5 / 4 / nthreads / P2 + 32;
+    // Virtual reservation only: pages are faulted in as chunks are first used. Generous
+    // per-line record estimates (events >= 50 bytes, clicks >= 30) plus per-thread slack
+    // for partly filled chunks; running out falls back to extra arenas.
+    let pool = Pool::new(ev_bytes / 50 * std::mem::size_of::<EvRec>()
+        + cl_bytes / 30 * std::mem::size_of::<CRec>()
+        + nthreads * (P1 + 2 * P2) * CHUNK * 2 + (64 << 20));
     let parse = || {
-        let mut evp = Parts::<EvRec>::alloc(ev_cap, P1);
-        let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
+        let mut al = Alloc::new(&pool);
+        let mut evp = Parts::<EvRec>::new(P1);
+        let mut clp = Parts::<CRec>::new(P2);
         let mut dc = DateCache::new();
         loop {
             let k = ev_next.fetch_add(1, AO::Relaxed);
             if k >= ev_chunks.len() { break; }
             let (fi,b,e) = ev_chunks[k];
-            parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
+            parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp,&mut al);
         }
         let ids = std::sync::LazyLock::force(&lm);
         loop {
             let k = cl_next.fetch_add(1, AO::Relaxed);
             if k >= cl_chunks.len() { break; }
             let (fi,b,e) = cl_chunks[k];
-            parse_clicks_direct(&ctx,&ex,ids,&mut dc,cl_maps[fi],b,e,&mut clp);
+            parse_clicks_direct(&ctx,&ex,ids,&mut dc,cl_maps[fi],b,e,&mut clp,&mut al);
         }
         (evp,clp)
     };
@@ -1902,12 +1968,15 @@ fn main() {
     let p_next = AtomicUsize::new(0);
     let pe_parts: Vec<Parts<PRec>> = std::thread::scope(|s| {
         let hs:Vec<_> = (0..nthreads).map(|_|s.spawn(|| {
-            let mut out = Parts::<PRec>::alloc(pr_cap,P2);
+            let mut al = Alloc::new(&pool);
+            let mut out = Parts::<PRec>::new(P2);
             let mut scratch = DedupScratch::default();
             loop {
                 let p=p_next.fetch_add(1,AO::Relaxed);
                 if p >= P1 {break;}
-                dedup_direct(lm,&ev_parts,p,&mut scratch,&mut out);
+                dedup_direct(lm,&ev_parts,p,&mut scratch,&mut out,&mut al);
+                // Partition p is consumed: its event chunks hold this thread's next outputs.
+                for part in &ev_parts { part.release(p, &mut al); }
             }
             out
         })).collect();
@@ -2019,9 +2088,14 @@ fn bench(data: &Path, mode: &str) {
         let mut dc = DateCache::new();
         let total: usize = ev_maps.iter().map(|m| m.len()).sum();
         let t = std::time::Instant::now();
-        let mut evp: Parts<EvRec> = Parts::alloc(total / 80 * 5 / 4 / P1 + 32, P1);
+        let pool = Pool::new(total);
+        let mut al = Alloc::new(&pool);
+        let mut evp: Parts<EvRec> = Parts::new(P1);
         eprintln!("alloc {:?}", t.elapsed());
-        for m in &ev_maps { parse_events(&ctx, &ex, &mut dc, m, 0, m.len(), &mut evp); if mode == "parse_np" { evp.clear(); } }
+        for m in &ev_maps {
+            parse_events(&ctx, &ex, &mut dc, m, 0, m.len(), &mut evp, &mut al);
+            if mode == "parse_np" { for p in 0..P1 { evp.release(p, &mut al); } evp = Parts::new(P1); }
+        }
         eprintln!("{} {:?} n={}", mode, t.elapsed(), (0..P1).map(|p| evp.count(p)).sum::<usize>());
         return;
     }
@@ -2116,18 +2190,24 @@ mod event_dedup_tests {
         let ids: Vec<_> = (1u64..).filter(|&key| bucket(key) == 0).take(3).collect();
         let singleton = (1u64..).find(|&key| bucket(key) == 1).unwrap();
         let event = |eid, user, ingest, ok| EvRec { eid, user, ts: 1, ingest, pc: 0, ok };
-        let mut a = Parts::alloc(1, 1);
-        let mut b = Parts::alloc(1, 1);
-        a.push(0, event(ids[0], 11, 2, 1));
-        a.push(0, event(ids[1], 22, 5, 1));
-        a.push(0, event(singleton, 33, 1, 1));
-        b.push(0, event(ids[0], 44, 1, 1));
-        b.push(0, event(ids[1], 55, 3, 0));
-        b.push(0, event(ids[2], 66, 1, 1));
+        let pool = Pool::new(1 << 20);
+        let mut al = Alloc::new(&pool);
+        let mut a = Parts::new(1);
+        let mut b = Parts::new(1);
+        a.push(&mut al, 0, event(ids[0], 11, 2, 1));
+        a.push(&mut al, 0, event(ids[1], 22, 5, 1));
+        a.push(&mut al, 0, event(singleton, 33, 1, 1));
+        b.push(&mut al, 0, event(ids[0], 44, 1, 1));
+        b.push(&mut al, 0, event(ids[1], 55, 3, 0));
+        b.push(&mut al, 0, event(ids[2], 66, 1, 1));
+        // Unrelated invalid events push the partition across several chunks.
+        for k in 0..2 * Parts::<EvRec>::K {
+            a.push(&mut al, 0, event(1_000_000 + k as u64, 77, 1, 0));
+        }
         let inputs = [a, b];
         let mut scratch = DedupScratch::default();
-        let mut out = Parts::alloc(1, P2);
-        dedup_direct(&LinkMap::empty(), &inputs, 0, &mut scratch, &mut out);
+        let mut out = Parts::new(P2);
+        dedup_direct(&LinkMap::empty(), &inputs, 0, &mut scratch, &mut out, &mut al);
         let mut users = Vec::new();
         for p in 0..P2 {
             out.each(p, |r| users.push(r.person));
@@ -2151,9 +2231,11 @@ mod event_dedup_tests {
                 let user = if i % 3 == 0 { "ub" } else { "uc" };
                 csv.extend_from_slice(format!("k{i},{user},c_1,{}\n", 1000 + i).as_bytes());
             }
-            let mut out = Parts::<CRec>::alloc(4, P2);
+            let pool = Pool::new(1 << 20);
+            let mut al = Alloc::new(&pool);
+            let mut out = Parts::<CRec>::new(P2);
             let mut dc = DateCache::new();
-            parse_clicks_direct(&ctx, &keys, &lm, &mut dc, &csv, 0, csv.len(), &mut out);
+            parse_clicks_direct(&ctx, &keys, &lm, &mut dc, &csv, 0, csv.len(), &mut out, &mut al);
             let mut got = Vec::new();
             for p in 0..P2 {
                 out.each(p, |r| {
