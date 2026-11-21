@@ -197,7 +197,6 @@ fn emit_line<'a, const N: usize>(m: &'a [u8], line_start: usize, ends: &[usize; 
         for k in 0..N {
             let t = ends[k];
             let l = t - s;
-            // first byte (or the separator after an empty field, never a quote)
             let q = (unsafe { *m.get_unchecked(s) } == b'"' && l > 0) as usize;
             let last_ok = l >= 2 && unsafe { *m.get_unchecked(t - 1) } == b'"';
             ok &= q == 0 || last_ok;
@@ -208,6 +207,40 @@ fn emit_line<'a, const N: usize>(m: &'a [u8], line_start: usize, ends: &[usize; 
             s = t + 1;
         }
         if !ok || quotes != 2 * qf {
+            return;
+        }
+    }
+    emit(&f);
+}
+
+/// Like `emit_line`, with the line's quote mask (bit i = byte line_start+i is a quote).
+#[inline(always)]
+fn emit_line_q<'a, const N: usize>(m: &'a [u8], ls: usize, ends: &[usize; N], q0: u64, q1: u64, emit: &mut impl FnMut(&[&'a [u8]; N])) {
+    let mut f: [&[u8]; N] = [&[]; N];
+    let mut s = ls;
+    if (q0 | q1) == 0 {
+        for k in 0..N {
+            let t = ends[k];
+            f[k] = unsafe { m.get_unchecked(s..t) };
+            s = t + 1;
+        }
+    } else {
+        let qm = (q0 as u128) | ((q1 as u128) << 64);
+        let mut expect: u128 = 0;
+        for k in 0..N {
+            let t = ends[k];
+            let rs = s - ls;
+            let rt = t - ls;
+            let q = (((qm >> rs) & 1) as usize) & ((t > s) as usize);
+            // a quoted field needs length >= 2; its closing quote is at rt-1
+            let qq = q & ((t >= s + 2) as usize);
+            expect |= ((qq as u128) << rs) | ((qq as u128) << (rt.wrapping_sub(1) & 127));
+            let a = s + qq;
+            let z = t - qq;
+            f[k] = unsafe { m.get_unchecked(a..z) };
+            s = t + 1;
+        }
+        if expect != qm {
             return;
         }
     }
@@ -327,10 +360,14 @@ unsafe fn scan_lines_avx512<const N: usize>(m: &[u8], b: usize, e: usize, emit: 
         let c0 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a0, vc), pl as u32);
         let c1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a1, vc), pl.saturating_sub(64) as u32);
         if (c0.count_ones() + c1.count_ones()) as usize == N - 1 {
-            let mut cm = (c0 as u128) | ((c1 as u128) << 64);
+            let mut x0 = c0;
+            let mut x1 = c1;
             for k in 0..N - 1 {
-                ends[k] = s + cm.trailing_zeros() as usize;
-                cm &= cm - 1;
+                let z0 = x0 == 0;
+                let pos = if z0 { 64 + x1.trailing_zeros() as usize } else { x0.trailing_zeros() as usize };
+                ends[k] = s + pos;
+                x0 &= x0.wrapping_sub(1);
+                x1 = if z0 { x1 & x1.wrapping_sub(1) } else { x1 };
             }
             ends[N - 1] = s + pl;
             let q0 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a0, vq), pl as u32);
@@ -818,7 +855,9 @@ fn floor_div(a: i64, b: i64) -> i64 {
 
 // ------------------------------------------------------------------ lookups
 struct Lookup {
-    prefix: &'static [u8],
+    p0: u8,
+    p1: u8,
+    plen: usize,
     arr: Vec<u16>,
     map: HashMap<Vec<u8>, u16>,
 }
@@ -826,12 +865,13 @@ const NONE16: u16 = u16::MAX;
 const ARR_LIMIT: usize = 10_000_000;
 impl Lookup {
     fn new(prefix: &'static [u8]) -> Self {
-        Lookup { prefix, arr: Vec::new(), map: HashMap::new() }
+        Lookup { p0: prefix[0], p1: if prefix.len() > 1 { prefix[1] } else { 0 }, plen: prefix.len(), arr: Vec::new(), map: HashMap::new() }
     }
-    #[inline]
+    #[inline(always)]
     fn canon(&self, s: &[u8]) -> Option<usize> {
-        let p = self.prefix.len();
-        if s.len() <= p || s.len() > p + 7 || &s[..p] != self.prefix {
+        let p = self.plen;
+        let n = s.len();
+        if n <= p || n > p + 7 || s[0] != self.p0 || (p == 2 && s[1] != self.p1) {
             return None;
         }
         let r = &s[p..];
@@ -846,30 +886,34 @@ impl Lookup {
             }
             v = v * 10 + d as usize;
         }
-        if v < ARR_LIMIT {
-            Some(v)
-        } else {
-            None
-        }
+        Some(v)
     }
     fn insert(&mut self, s: &[u8], val: u16) {
-        if let Some(n) = self.canon(s) {
-            if n >= self.arr.len() {
-                self.arr.resize(n + 1, NONE16);
+        match self.canon(s) {
+            Some(n) if n < ARR_LIMIT => {
+                if n >= self.arr.len() {
+                    self.arr.resize(n + 1, NONE16);
+                }
+                self.arr[n] = val;
             }
-            self.arr[n] = val;
-        } else {
-            self.map.insert(s.to_vec(), val);
+            _ => {
+                self.map.insert(s.to_vec(), val);
+            }
         }
     }
-    #[inline]
+    #[inline(always)]
     fn get(&self, s: &[u8]) -> Option<u16> {
-        if let Some(n) = self.canon(s) {
-            match self.arr.get(n) {
+        match self.canon(s) {
+            Some(n) if n < ARR_LIMIT => match self.arr.get(n) {
                 Some(&v) if v != NONE16 => Some(v),
                 _ => None,
-            }
-        } else if self.map.is_empty() {
+            },
+            _ => self.get_slow(s),
+        }
+    }
+    #[cold]
+    fn get_slow(&self, s: &[u8]) -> Option<u16> {
+        if self.map.is_empty() {
             None
         } else {
             self.map.get(s).copied()
