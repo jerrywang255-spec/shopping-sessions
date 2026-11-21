@@ -49,8 +49,10 @@ with tempfile.TemporaryDirectory() as tmp:
         else:
             env.pop("SS_PREFAULT", None)
         env.pop("SS_SCALAR_CSV", None)
+        env.pop("SS_SHORT_SIMD", None)
         env.pop("SS_RADIX_EVENTS", None)
         if parser == "scalar": env["SS_SCALAR_CSV"] = "1"
+        if parser == "short": env["SS_SHORT_SIMD"] = "1"
         if sort == "radix": env["SS_RADIX_EVENTS"] = "1"
         t0 = time.perf_counter()
         result = subprocess.run([str(a.candidate.resolve())], env=env, text=True, capture_output=True)
