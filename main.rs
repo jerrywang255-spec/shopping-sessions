@@ -1224,11 +1224,14 @@ fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
         }
         let rec = if ok {
             let user = ex.key_in(f[1], lim);
-            let cat = match ctx.prods.get(f[5]) {
-                Some(c) => c as u32,
-                None => ctx.unknown_cat,
+            // Only purchases contribute to category revenue.
+            let pc = if price == 0 {
+                0
+            } else {
+                let category = ctx.prods.get(f[5]).map(u32::from).unwrap_or(ctx.unknown_cat);
+                price | (category << 24)
             };
-            EvRec { eid, user, ts: (ts - base) as u32, ingest, pc: price | (cat << 24), ok: 1 }
+            EvRec { eid, user, ts: (ts - base) as u32, ingest, pc, ok: 1 }
         } else {
             EvRec { eid, user: 0, ts: 0, ingest, pc: 0, ok: 0 }
         };
