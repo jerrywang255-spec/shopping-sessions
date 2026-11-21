@@ -1,0 +1,57 @@
+name: Benchmark profile-guided container
+on:
+  push:
+    branches: ["optimization/profile-guided"]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      BASELINE: 5bc6fce2ea8b10a97d571bc34b03fde7e7a42e91
+      NCPU: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build release images and extract the scoring binaries
+        run: |
+          mkdir -p variants /tmp/v3
+          git archive "$BASELINE" | tar -x -C /tmp/v3
+          docker build -q -t ss-baseline /tmp/v3
+          docker build -q --target plain -t ss-combined .
+          docker build --target training -t ss-training .
+          docker build -q -t ss-profiled .
+          for name in baseline combined profiled; do
+            container=$(docker create "ss-$name")
+            docker cp "$container:/app/ss" "variants/$name"
+            docker rm "$container"
+          done
+          container=$(docker create ss-training /bin/true)
+          docker cp "$container:/tmp/training/generator/target/release/generate" /tmp/generate
+          docker rm "$container"
+      - name: Check both candidates on all official fixtures and public dev answers
+        run: |
+          python3 -m pip install --user pyarrow==23.0.0 polars
+          url=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for archive in starter-duckdb dev-answer; do
+            curl -fsSL --retry 3 "$url/$archive.zip" -o "/tmp/$archive.zip"
+            unzip -q "/tmp/$archive.zip" -d /tmp
+          done
+          /tmp/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev-input
+          for name in combined profiled; do
+            python3 /tmp/starter-duckdb/scripts/run_fixtures.py /tmp/starter-duckdb/fixtures -- "variants/$name"
+            mkdir -p "/tmp/dev-$name"
+            chmod 777 "/tmp/dev-$name"
+            docker run --rm --network none --read-only -e NCPU=8 -v /tmp/dev-input:/data:ro -v "/tmp/dev-$name:/output" "ss-$name"
+            python3 /tmp/starter-duckdb/scripts/compare.py "/tmp/dev-$name" /tmp/dev-answer
+          done
+      - name: Compare builds on two independent full-scale datasets
+        run: |
+          for seed in 29 71; do
+            export SEED=$seed DATA_DIR="/tmp/benchmark-$seed"
+            /tmp/generate --seed "$seed" --events 20000000 --clicks 5000000 --output "$DATA_DIR"
+            python3 experiments/profile_guided.py
+            rm -r "$DATA_DIR"
+          done
