@@ -1289,41 +1289,75 @@ fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache,
     });
 }
 
-fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, table: &mut Vec<Option<&'a EvRec>>, out: &mut Parts<PRec>) {
+#[derive(Default)]
+struct DedupScratch<'a> {
+    // Each word tracks 64 hash buckets. The second mask flags buckets visited twice.
+    buckets: Vec<[u64; 2]>,
+    winners: Vec<Option<&'a EvRec>>,
+}
+
+fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>) {
     let n: usize = parts.iter().map(|part| part.count(p)).sum();
     if n == 0 {
         return;
     }
-    let cap = (n * 2).next_power_of_two();
-    let mask = cap - 1;
-    table.clear();
-    table.resize(cap, None);
-    let shift = 64 - P1_BITS - (cap.trailing_zeros());
-    for r in parts.iter().flat_map(|part| part.main(p).iter().chain(&part.spill[p])) {
-        let h = r.eid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut s = ((h << P1_BITS) >> (P1_BITS + shift)) as usize & mask;
-        loop {
-            let Some(previous) = table[s] else {
-                table[s] = Some(r);
-                break;
-            };
-            if previous.eid == r.eid {
-                if r.ingest < previous.ingest {
-                    table[s] = Some(r);
-                }
-                break;
-            }
-            s = (s + 1) & mask;
-        }
+    let buckets = (n * 8).next_power_of_two().max(64);
+    scratch.buckets.clear();
+    scratch.buckets.resize(buckets / 64, [0, 0]);
+    let hash = |eid: u64| eid.wrapping_mul(0x9E37_79B9_7F4A_7C15) << P1_BITS;
+    let shift = 64 - buckets.trailing_zeros();
+    let records = || parts.iter().flat_map(|part| part.main(p).iter().chain(&part.spill[p]));
+    let mut collisions = 0usize;
+    for record in records() {
+        let index = (hash(record.eid) >> shift) as usize;
+        let bit = 1u64 << (index % 64);
+        let state = &mut scratch.buckets[index / 64];
+        let already_seen = state[0] & bit;
+        state[1] |= already_seen;
+        state[0] |= bit;
+        collisions += usize::from(already_seen != 0);
     }
-    for r in table.iter().flatten() {
+
+    // A bucket with k >= 2 records contributes k-1 collisions, so at most
+    // 2 * collisions records need exact deduplication. Leave the table half empty.
+    let capacity = (4 * collisions).next_power_of_two().max(2);
+    scratch.winners.clear();
+    scratch.winners.resize(capacity, None);
+    let table_shift = 64 - capacity.trailing_zeros();
+    let mut emit = |r: &EvRec| {
         if r.ok != 0 {
             let person = lm.get(r.user);
             out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
         }
+    };
+    for record in records() {
+        let h = hash(record.eid);
+        let index = (h >> shift) as usize;
+        if scratch.buckets[index / 64][1] & (1u64 << (index % 64)) == 0 {
+            emit(record);
+            continue;
+        }
+        let mut slot = (h >> table_shift) as usize;
+        loop {
+            match scratch.winners[slot] {
+                None => {
+                    scratch.winners[slot] = Some(record);
+                    break;
+                }
+                Some(previous) if previous.eid == record.eid => {
+                    if record.ingest < previous.ingest {
+                        scratch.winners[slot] = Some(record);
+                    }
+                    break;
+                }
+                Some(_) => slot = (slot + 1) & (capacity - 1),
+            }
+        }
+    }
+    for winner in scratch.winners.iter().flatten() {
+        emit(winner);
     }
 }
-
 
 // ------------------------------------------------------------------ stage 4: sessions
 struct Agg {
@@ -1792,11 +1826,11 @@ fn main() {
     let pe_parts: Vec<Parts<PRec>> = std::thread::scope(|s| {
         let hs:Vec<_> = (0..nthreads).map(|_|s.spawn(|| {
             let mut out = Parts::<PRec>::alloc(pr_cap,P2);
-            let mut table = Vec::new();
+            let mut scratch = DedupScratch::default();
             loop {
                 let p=p_next.fetch_add(1,AO::Relaxed);
                 if p >= P1 {break;}
-                dedup_direct(&lm,&ev_parts,p,&mut table,&mut out);
+                dedup_direct(&lm,&ev_parts,p,&mut scratch,&mut out);
             }
             out
         })).collect();
