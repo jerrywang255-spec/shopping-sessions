@@ -469,6 +469,9 @@ impl<T: Copy> Parts<T> {
 }
 
 // ------------------------------------------------------------------ keys
+// 63-symbol compact alphabet, codes assigned in ascending byte order so the
+// packed u64 preserves lexical order: digits 1..=10, uppercase 11..=36,
+// '_' 37 (byte 95 sits between 'Z'=90 and 'a'=97), lowercase 38..=63.
 const fn build_enc() -> [u8; 256] {
     let mut t = [0u8; 256];
     let mut i = 0;
@@ -479,13 +482,14 @@ const fn build_enc() -> [u8; 256] {
     i = 0;
     while i < 26 {
         t[b'A' as usize + i] = 11 + i as u8;
-        t[b'a' as usize + i] = 37 + i as u8;
+        t[b'a' as usize + i] = 38 + i as u8;
         i += 1;
     }
+    t[b'_' as usize] = 37;
     t
 }
 static ENC: [u8; 256] = build_enc();
-const DEC: &[u8; 63] = b"\x000123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const DEC: &[u8; 64] = b"\x000123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
 
 #[inline]
 fn enc_key(s: &[u8]) -> Option<u64> {
@@ -551,13 +555,13 @@ impl Exotic {
     }
     #[inline]
     fn key(&self, s: &[u8]) -> u64 {
+        if let Some(k) = enc_key(s) {
+            return k;
+        }
         if let Some(key) = ascii9(s) {
             return key;
         }
-        match enc_key(s) {
-            Some(k) => k,
-            None => self.intern(s),
-        }
+        self.intern(s)
     }
     #[cold]
     fn intern(&self, s: &[u8]) -> u64 {
@@ -658,21 +662,20 @@ impl Exotic {
     }
 
     /// Key for a field inside a buffer ending at `lim`.
+    // The compact alphabet now includes '_', so the common u_/cl_/link ids of
+    // up to ten bytes pack losslessly and lock-free via scalar enc_key, which
+    // is what removes the mutex-guarded interner from the hot click path. Only
+    // ids with characters outside that 63-symbol alphabet fall to ascii9 (any
+    // 7-bit ASCII up to nine bytes) and finally to the interner.
     #[inline(always)]
-    fn key_in(&self, s: &[u8], lim: usize) -> u64 {
+    fn key_in(&self, s: &[u8], _lim: usize) -> u64 {
+        if let Some(k) = enc_key(s) {
+            return k;
+        }
         if let Some(key) = ascii9(s) {
             return key;
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if (s.as_ptr() as usize) + 16 <= lim {
-                if let Some(k) = unsafe { enc_key16(s) } {
-                    return k;
-                }
-                return self.intern(s);
-            }
-        }
-        self.key(s)
+        self.intern(s)
     }
 }
 
