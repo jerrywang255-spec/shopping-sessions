@@ -41,6 +41,8 @@ def make_data(root, n_events, n_clicks):
               ((f"c_{c}",f"ch_{c%5}") for c in range(campaigns)))
     write_csv(d/"links"/"part.csv", ["user_id_a","user_id_b"],
               ((f"u_{i}", f"u_{i-1}") for i in range(1,600) if i%3 != 0))
+    (d / "events").mkdir(exist_ok=True)
+    (d / "clicks").mkdir(exist_ok=True)
     start = int(dt.datetime(2026,10,1,tzinfo=dt.timezone.utc).timestamp()*1000)
     with (d/"events"/"part.csv").open("w",newline="") as f:
         w=csv.writer(f,lineterminator="\n")
