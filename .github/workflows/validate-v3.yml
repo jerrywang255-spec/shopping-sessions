@@ -16,7 +16,11 @@ jobs:
         run: python3 -m py_compile benchmark.py
       - name: Create Cargo source directory
         run: mkdir -p src && cp main.rs pq.rs src/
+      - name: Install Parquet test reader
+        run: python3 -m pip install --user pyarrow==23.0.0
       - name: Compile debug binary
         run: cargo check --offline
       - name: Build release binary
         run: cargo build --release --offline
+      - name: Validate end-to-end correctness
+        run: python3 tests/smoke.py target/release/ss
