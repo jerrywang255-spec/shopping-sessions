@@ -1,0 +1,42 @@
+name: Profile Rust V3 configurations
+on:
+  push:
+    branches: ["optimization/experiments"]
+  workflow_dispatch:
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Show hardware
+        run: |
+          nproc
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core\(s\)|Flags'
+      - name: Compile V3 with release settings
+        run: |
+          mkdir -p src
+          cp main.rs pq.rs src/
+          cargo build --release --offline
+      - name: Download official challenge generator
+        run: |
+          curl --fail --location --retry 3 --silent --show-error \
+            https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip \
+            -o generator.zip
+          unzip -q generator.zip -d generator-src
+          find generator-src -maxdepth 3 -name Cargo.toml
+      - name: Compile generator
+        run: |
+          MANIFEST="$(find generator-src -name Cargo.toml | head -1)"
+          cargo build --manifest-path "$MANIFEST" --release --offline
+          echo "GENERATOR=$(dirname "$MANIFEST")/target/release/generate" >> "$GITHUB_ENV"
+      - name: Generate representative dataset
+        run: |
+          "$GENERATOR" --seed 17 --events 3000000 --clicks 800000 --output /tmp/shopping-input
+          du -sh /tmp/shopping-input
+      - name: Profile 12 runner configurations
+        run: |
+          python3 experiments/profile_matrix.py --candidate target/release/ss \
+            --data /tmp/shopping-input --repeats 2 --threads 2,4,8 --prefault 0,1
