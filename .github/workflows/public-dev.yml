@@ -1,0 +1,60 @@
+name: Validate all four builds against the public dev answer
+on:
+  push:
+    branches: ["optimization/public-dev-validation"]
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64-v3
+      BASELINE: 5bc6fce2ea8b10a97d571bc34b03fde7e7a42e91
+      EPOCH: 1c7413d37e5912aa2d4b67fb4b7f91b05759824f
+      BOTH: 955b2fb3375770633ddf5f5d58546daed3401ce1
+      SEED: 1
+      NCPU: 4
+      DATA_DIR: /tmp/shopping-input
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Build and run the competition generator
+        run: |
+          curl --fail --location --retry 3 --silent --show-error \
+            https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/generator.zip
+          unzip -q /tmp/generator.zip -d /tmp/shopping-generator
+          manifest=$(find /tmp/shopping-generator -name Cargo.toml -print -quit)
+          cargo build --manifest-path "$manifest" --target-dir /tmp/gen-target --release --offline
+          /tmp/gen-target/release/generate --seed "$SEED" --events 1000000 --clicks 250000 --output "$DATA_DIR"
+      - name: Compile and smoke-test all four variants
+        run: |
+          python3 -m pip install --user pyarrow==23.0.0
+          mkdir -p src variants
+          cp pq.rs src/
+          for name in baseline epoch dedup combined; do
+            case "$name" in
+              baseline) git show "$BASELINE:main.rs" > src/main.rs ;;
+              epoch) git show "$EPOCH:main.rs" > src/main.rs ;;
+              combined) git show "$BOTH:main.rs" > src/main.rs ;;
+              dedup)
+                git show "$BASELINE:main.rs" > src/main.rs
+                git diff "$EPOCH" "$BOTH" -- main.rs | git apply --directory=src ;;
+            esac
+            cargo build --release --offline --quiet
+            cp target/release/ss "variants/$name"
+            python3 tests/smoke.py "variants/$name"
+          done
+          cargo test --offline
+      - name: Compare every build with the official dev answer
+        run: |
+          curl --fail --location --retry 3 --silent --show-error \
+            https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip -o /tmp/dev-answer.zip
+          unzip -q /tmp/dev-answer.zip -d /tmp
+          for name in baseline epoch dedup combined; do
+            export OUTPUT_DIR="/tmp/dev-results/$name"
+            "variants/$name"
+            python3 tests/public_dev.py "$OUTPUT_DIR" /tmp/dev-answer
+          done
