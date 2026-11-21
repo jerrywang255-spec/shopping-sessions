@@ -1,0 +1,22 @@
+name: Validate V3 Rust build
+on:
+  push:
+    branches: ["optimization/v3"]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Verify benchmark Python syntax
+        run: python3 -m py_compile benchmark.py
+      - name: Create Cargo source directory
+        run: mkdir -p src && cp main.rs pq.rs src/
+      - name: Compile debug binary
+        run: cargo check --offline
+      - name: Build release binary
+        run: cargo build --release --offline
