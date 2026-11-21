@@ -19,6 +19,8 @@ jobs:
           unzip -q generator.zip -d generator-src
       - name: Compile the generator
         run: |
+          mkdir -p src
+          cp main.rs pq.rs src/
           MANIFEST="$(find generator-src -name Cargo.toml | head -1)"
           cargo build --manifest-path "$MANIFEST" --release --offline
           echo "GENERATOR=$(dirname "$MANIFEST")/target/release/generate" >> "$GITHUB_ENV"
