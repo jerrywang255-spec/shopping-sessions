@@ -20,9 +20,12 @@ ap.add_argument("--data", type=Path, required=True)
 ap.add_argument("--repeats", type=int, default=3)
 ap.add_argument("--threads", default="2,4,8")
 ap.add_argument("--prefault", default="0,1")
+ap.add_argument("--parsers", default="simd")
+ap.add_argument("--sorts", default="std")
+ap.add_argument("--check", action="store_true")
 a = ap.parse_args()
 
-variants = [(int(n), int(pre)) for n in a.threads.split(",") for pre in a.prefault.split(",")]
+variants = [(int(n), int(pre), parser, sort) for n in a.threads.split(",") for pre in a.prefault.split(",") for parser in a.parsers.split(",") for sort in a.sorts.split(",")]
 runs = variants * a.repeats
 random.Random(20261121).shuffle(runs)
 results = {v: [] for v in variants}
@@ -31,7 +34,8 @@ pat = re.compile(r"^\s*(\d+(?:\.\d+)?) ms  (.+)$", re.M)
 
 with tempfile.TemporaryDirectory() as tmp:
     out = Path(tmp) / "output"
-    for iteration, (n, pre) in enumerate(runs):
+    reference = None
+    for iteration, (n, pre, parser, sort) in enumerate(runs):
         shutil.rmtree(out, ignore_errors=True)
         env = os.environ.copy()
         env.update(
@@ -44,6 +48,10 @@ with tempfile.TemporaryDirectory() as tmp:
             env["SS_PREFAULT"] = "1"
         else:
             env.pop("SS_PREFAULT", None)
+        env.pop("SS_SCALAR_CSV", None)
+        env.pop("SS_RADIX_EVENTS", None)
+        if parser == "scalar": env["SS_SCALAR_CSV"] = "1"
+        if sort == "radix": env["SS_RADIX_EVENTS"] = "1"
         t0 = time.perf_counter()
         result = subprocess.run([str(a.candidate.resolve())], env=env, text=True, capture_output=True)
         elapsed = time.perf_counter() - t0
@@ -53,13 +61,23 @@ with tempfile.TemporaryDirectory() as tmp:
             raise RuntimeError("Missing user_daily output")
         if not list((out/"campaign_daily").glob("*.parquet")):
             raise RuntimeError("Missing campaign_daily output")
-        results[(n,pre)].append(elapsed)
+        if a.check:
+            import pyarrow.parquet as pq
+            def signature(folder):
+                allrows = []
+                for file in folder.glob("*.parquet"):
+                    allrows.extend(pq.read_table(file).to_pylist())
+                return sorted(repr(sorted(r.items())) for r in allrows)
+            digest = (signature(out/"user_daily"), signature(out/"campaign_daily"))
+            if reference is None: reference = digest
+            assert digest == reference, f"Incorrect result variant {n,pre,parser,sort}"
+        results[(n,pre,parser,sort)].append(elapsed)
         marks = [(label, float(ms)) for ms, label in pat.findall(result.stderr)]
         prev = 0.
         for label, ms in marks:
-            stages[(n,pre)].setdefault(label,[]).append(ms-prev)
+            stages[(n,pre,parser,sort)].setdefault(label,[]).append(ms-prev)
             prev = ms
-        print(f"run={iteration:02d} threads={n} prefault={pre} seconds={elapsed:.4f} "+
+        print(f"run={iteration:02d} threads={n} prefault={pre} parser={parser} sort={sort} seconds={elapsed:.4f} "+
               " stages="+",".join(f"{label}:{ms:.1f}ms" for label,ms in marks), flush=True)
 
 print("\n=== Results, medians on this runner and this dataset ===",flush=True)
@@ -67,4 +85,4 @@ for variant in sorted(variants,key=lambda v: statistics.median(results[v])):
     med = statistics.median(results[variant])
     detail = ", ".join(f"{label}:{statistics.median(samples):.1f}ms"
                        for label,samples in stages[variant].items())
-    print(f"threads={variant[0]} prefault={variant[1]} median={med:.4f}s ; {detail}",flush=True)
+    print(f"threads={variant[0]} prefault={variant[1]} parser={variant[2]} sort={variant[3]} median={med:.4f}s ; {detail}",flush=True)
