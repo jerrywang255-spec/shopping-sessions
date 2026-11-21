@@ -2,7 +2,6 @@
 FROM rust:1.91-slim-bookworm AS build
 WORKDIR /src
 COPY main.rs pq.rs ./src/
-COPY src ./src
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release --offline && strip target/release/ss
 
