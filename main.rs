@@ -165,7 +165,11 @@ fn scan_lines<const N: usize>(m: &[u8], b: usize, e: usize, emit: &mut impl FnMu
             return;
         }
         if is_x86_feature_detected!("avx2") {
-            unsafe { scan_lines_avx2::<N>(m, b, e, emit) };
+            if std::env::var_os("SS_SHORT_SIMD").is_some() {
+                unsafe { scan_lines_avx2_short::<N>(m, b, e, emit) };
+            } else {
+                unsafe { scan_lines_avx2::<N>(m, b, e, emit) };
+            }
             return;
         }
     }
@@ -254,6 +258,70 @@ fn emit_line_q<'a, const N: usize>(m: &'a [u8], ls: usize, ends: &[usize; N], q0
         }
     }
     emit(&f);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_lines_avx2_short<const N: usize>(m: &[u8], b: usize, e: usize, emit: &mut impl FnMut(&[&[u8]; N])) {
+    use std::arch::x86_64::*;
+    let len = m.len();
+    let mut s = match first_line_start(m, b) {
+        Some(p) => p,
+        None => return,
+    };
+    // Most event rows fit in 96 bytes; clicks/links usually fit in 64.
+    // For uncommon longer lines use the fully validating scalar fallback.
+    let width = if N >= 7 { 96 } else { 64 };
+    let vc = _mm256_set1_epi8(b',' as i8);
+    let vn = _mm256_set1_epi8(b'\n' as i8);
+    let vq = _mm256_set1_epi8(b'"' as i8);
+    let base = m.as_ptr();
+    let mut ends = [0usize; N];
+    while s < e && s + width <= len {
+        let p = base.add(s);
+        let x0 = _mm256_loadu_si256(p as *const __m256i);
+        let x1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let x2 = if N >= 7 {
+            _mm256_loadu_si256(p.add(64) as *const __m256i)
+        } else {
+            _mm256_setzero_si256()
+        };
+        let mv = |x: __m256i, v: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, v)) as u32 as u128;
+        let mask = |v: __m256i| mv(x0, v) | (mv(x1, v) << 32) | (mv(x2, v) << 64);
+        let nm = mask(vn);
+        if nm == 0 {
+            let (line, next) = match memchr(b'\n', &m[s..]) {
+                Some(i) => (&m[s..s+i], s+i+1),
+                None => (&m[s..], len),
+            };
+            let mut f: [&[u8]; N] = [&[]; N];
+            if fields(line, &mut f) { emit(&f); }
+            s = next;
+            continue;
+        }
+        let pl = nm.trailing_zeros() as usize;
+        let below = (1u128 << pl)-1;
+        let mut cm = mask(vc) & below;
+        if cm.count_ones() as usize == N-1 {
+            for k in 0..N-1 {
+                ends[k] = s + cm.trailing_zeros() as usize;
+                cm &= cm-1;
+            }
+            ends[N-1] = s+pl;
+            let qm = mask(vq) & below;
+            emit_line(m,s,&ends,qm.count_ones(),emit);
+        }
+        s += pl+1;
+    }
+    while s < e && s < len {
+        let (line, next) = match memchr(b'\n', &m[s..]) {
+            Some(i) => (&m[s..s+i], s+i+1),
+            None => (&m[s..], len),
+        };
+        let mut f: [&[u8]; N] = [&[]; N];
+        if fields(line, &mut f) { emit(&f); }
+        s=next;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
