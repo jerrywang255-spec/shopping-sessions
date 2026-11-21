@@ -41,4 +41,4 @@ jobs:
       - name: Profile parser and sorting matrix
         run: |
           python3 experiments/profile_matrix.py --candidate target/release/ss \
-            --data /tmp/shopping-input --repeats 2 --threads 4,8 --prefault 0 --parsers simd,scalar --sorts std,radix --check
+            --data /tmp/shopping-input --repeats 4 --threads 4 --prefault 0 --parsers simd,short --sorts std --check
