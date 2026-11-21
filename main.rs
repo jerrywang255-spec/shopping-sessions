@@ -2007,3 +2007,62 @@ fn bench(data: &Path, mode: &str) {
     }
     eprintln!("{} {:?} cnt={} acc={}", mode, t.elapsed(), cnt, acc);
 }
+
+#[cfg(test)]
+mod event_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn event_keys_are_distinct_across_packed_and_fallback_encodings() {
+        let keys = Exotic::new();
+        let mut seen = HashMap::new();
+        let mut check = |id: &[u8]| {
+            let mut input = [0u8; 32];
+            input[..id.len()].copy_from_slice(id);
+            let field = &input[..id.len()];
+            let start = input.as_ptr() as usize;
+            let key = keys.event_key(field, start + input.len());
+            assert_eq!(key, keys.event_key(field, start + field.len()));
+            if let Some(previous) = seen.insert(key, id.to_vec()) {
+                assert_eq!(previous, id);
+            }
+        };
+        for len in 1..=12 {
+            check(&b"abcdefghijkl"[..len]);
+        }
+        for at in 0..9 {
+            for byte in 0..=255 {
+                let mut id = *b"e12345678";
+                id[at] = byte;
+                check(&id);
+            }
+        }
+    }
+
+    #[test]
+    fn colliding_event_ids_and_spilled_duplicates_keep_the_earliest_copy() {
+        // Put three distinct IDs in one 64-bucket filter slot and one in another.
+        let bucket = |key: u64| key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - P1_BITS - 6);
+        let ids: Vec<_> = (1u64..).filter(|&key| bucket(key) == 0).take(3).collect();
+        let singleton = (1u64..).find(|&key| bucket(key) == 1).unwrap();
+        let event = |eid, user, ingest, ok| EvRec { eid, user, ts: 1, ingest, pc: 0, ok };
+        let mut a = Parts::alloc(1, 1);
+        let mut b = Parts::alloc(1, 1);
+        a.push(0, event(ids[0], 11, 2, 1));
+        a.push(0, event(ids[1], 22, 5, 1));
+        a.push(0, event(singleton, 33, 1, 1));
+        b.push(0, event(ids[0], 44, 1, 1));
+        b.push(0, event(ids[1], 55, 3, 0));
+        b.push(0, event(ids[2], 66, 1, 1));
+        let inputs = [a, b];
+        let mut scratch = DedupScratch::default();
+        let mut out = Parts::alloc(1, P2);
+        dedup_direct(&LinkMap::empty(), &inputs, 0, &mut scratch, &mut out);
+        let mut users = Vec::new();
+        for p in 0..P2 {
+            out.each(p, |r| users.push(r.person));
+        }
+        users.sort_unstable();
+        assert_eq!(users, [33, 44, 66]);
+    }
+}
