@@ -266,6 +266,11 @@ fn emit_line_q<'a, const N: usize>(m: &'a [u8], ls: usize, ends: &[usize; N], q0
     emit(&f);
 }
 
+/// Input bytes are prefetched this far ahead of the line scanner: page-cache pages are 4 KB
+/// and physically scattered, so the hardware prefetcher stalls at every page boundary.
+/// A prefetch never faults, so running past the end of the mapping is harmless.
+const PF_DIST: usize = 1024;
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
 unsafe fn scan_lines_avx2<const N: usize>(m: &[u8], b: usize, e: usize, emit: &mut impl FnMut(&[&[u8]; N])) {
@@ -288,6 +293,7 @@ unsafe fn scan_lines_avx2<const N: usize>(m: &[u8], b: usize, e: usize, emit: &m
     let _ = mask64;
     while s < e && s + 128 <= len {
         let p = base.add(s);
+        _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(PF_DIST) as *const i8);
         let a0 = _mm256_loadu_si256(p as *const __m256i);
         let a1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
         let a2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
@@ -356,6 +362,7 @@ unsafe fn scan_lines_avx512<const N: usize>(m: &[u8], b: usize, e: usize, emit: 
     let mut ends = [0usize; N];
     while s < e && s + 128 <= len {
         let p = base.add(s);
+        _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(PF_DIST) as *const i8);
         let a0 = _mm512_loadu_si512(p as *const _);
         let a1 = _mm512_loadu_si512(p.add(64) as *const _);
         let n0 = _mm512_cmpeq_epi8_mask(a0, vn);
