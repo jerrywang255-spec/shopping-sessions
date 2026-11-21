@@ -514,6 +514,21 @@ fn dec_key(k: u64, out: &mut Vec<u8>) {
 }
 
 /// Interner for IDs that do not fit the compact encoding (rare).
+// Nine-byte ASCII keys retain their byte-wise order in this range.
+#[inline(always)]
+fn ascii9(id: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    if id.len() == 9 && (16..128).contains(&id[0]) {
+        let tail = u64::from_be_bytes(id[1..].try_into().unwrap());
+        const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+        if tail & !ASCII == 0 {
+            let suffix = unsafe { std::arch::x86_64::_pext_u64(tail, ASCII) };
+            return Some((u64::from(id[0]) << 56) | suffix);
+        }
+    }
+    None
+}
+
 struct Exotic {
     inner: Mutex<(HashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>,
 }
@@ -523,6 +538,9 @@ impl Exotic {
     }
     #[inline]
     fn key(&self, s: &[u8]) -> u64 {
+        if let Some(key) = ascii9(s) {
+            return key;
+        }
         match enc_key(s) {
             Some(k) => k,
             None => self.intern(s),
@@ -543,13 +561,17 @@ impl Exotic {
         if k & EXOTIC != 0 {
             let g = self.inner.lock().unwrap();
             out.extend_from_slice(&g.1[(k & !EXOTIC) as usize]);
+        } else if k >= 1 << 60 {
+            for i in (0..9).rev() {
+                out.push(((k >> (7 * i)) & 0x7f) as u8);
+            }
         } else {
             dec_key(k, out);
         }
     }
     #[inline]
     fn cmp(&self, a: u64, b: u64) -> Ordering {
-        if (a | b) & EXOTIC == 0 {
+        if (a | b) & EXOTIC == 0 && (a < 1 << 60) == (b < 1 << 60) {
             a.cmp(&b)
         } else {
             self.cmp_slow(a, b)
@@ -619,6 +641,9 @@ impl Exotic {
     /// Key for a field inside a buffer ending at `lim`.
     #[inline(always)]
     fn key_in(&self, s: &[u8], lim: usize) -> u64 {
+        if let Some(key) = ascii9(s) {
+            return key;
+        }
         #[cfg(target_arch = "x86_64")]
         {
             if (s.as_ptr() as usize) + 16 <= lim {
