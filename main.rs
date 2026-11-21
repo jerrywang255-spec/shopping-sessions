@@ -1162,8 +1162,8 @@ struct Ctx {
     unknown_cat: u32,
 }
 
-const P1_BITS: u32 = 10;
-const P2_BITS: u32 = 10;
+const P1_BITS: u32 = 6;
+const P2_BITS: u32 = 8;
 const P1: usize = 1 << P1_BITS;
 const P2: usize = 1 << P2_BITS;
 
