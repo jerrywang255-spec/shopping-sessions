@@ -469,6 +469,9 @@ impl<T: Copy> Parts<T> {
 }
 
 // ------------------------------------------------------------------ keys
+// 63-symbol compact alphabet, codes assigned in ascending byte order so the
+// packed u64 preserves lexical order: digits 1..=10, uppercase 11..=36,
+// '_' 37 (byte 95 sits between 'Z'=90 and 'a'=97), lowercase 38..=63.
 const fn build_enc() -> [u8; 256] {
     let mut t = [0u8; 256];
     let mut i = 0;
@@ -479,13 +482,14 @@ const fn build_enc() -> [u8; 256] {
     i = 0;
     while i < 26 {
         t[b'A' as usize + i] = 11 + i as u8;
-        t[b'a' as usize + i] = 37 + i as u8;
+        t[b'a' as usize + i] = 38 + i as u8;
         i += 1;
     }
+    t[b'_' as usize] = 37;
     t
 }
 static ENC: [u8; 256] = build_enc();
-const DEC: &[u8; 63] = b"\x000123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const DEC: &[u8; 64] = b"\x000123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
 
 #[inline]
 fn enc_key(s: &[u8]) -> Option<u64> {
@@ -514,6 +518,34 @@ fn dec_key(k: u64, out: &mut Vec<u8>) {
 }
 
 /// Interner for IDs that do not fit the compact encoding (rare).
+// ASCII keys of up to nine bytes retain their byte-wise order in this range,
+// which lets them skip the mutex-guarded interner even when they contain
+// characters outside the compact alphabet (e.g. the '_' in u_/cl_/link ids).
+// Byte 0 in [16,128) puts the packed value in [1<<60, 1<<63), disjoint from
+// both the compact enc_key range (< 1<<60) and the EXOTIC range (1<<63).
+#[inline(always)]
+fn ascii9(id: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let n = id.len();
+        if (1..=9).contains(&n) && (16..128).contains(&id[0]) {
+            // Load nine bytes big-endian, zero-padding the absent low bytes so
+            // a shorter string sorts before a longer one sharing its prefix.
+            let mut buf = [0u8; 9];
+            buf[..n].copy_from_slice(id);
+            let tail = u64::from_be_bytes(buf[1..].try_into().unwrap());
+            const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+            // Reject any byte with the high bit set (non-7-bit ASCII).
+            let head_ok = u64::from(buf[0]) < 128;
+            if head_ok && tail & !ASCII == 0 {
+                let suffix = unsafe { std::arch::x86_64::_pext_u64(tail, ASCII) };
+                return Some((u64::from(buf[0]) << 56) | suffix);
+            }
+        }
+    }
+    None
+}
+
 struct Exotic {
     inner: Mutex<(HashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>,
 }
@@ -523,10 +555,13 @@ impl Exotic {
     }
     #[inline]
     fn key(&self, s: &[u8]) -> u64 {
-        match enc_key(s) {
-            Some(k) => k,
-            None => self.intern(s),
+        if let Some(k) = enc_key(s) {
+            return k;
         }
+        if let Some(key) = ascii9(s) {
+            return key;
+        }
+        self.intern(s)
     }
     #[cold]
     fn intern(&self, s: &[u8]) -> u64 {
@@ -543,13 +578,23 @@ impl Exotic {
         if k & EXOTIC != 0 {
             let g = self.inner.lock().unwrap();
             out.extend_from_slice(&g.1[(k & !EXOTIC) as usize]);
+        } else if k >= 1 << 60 {
+            // ascii9 pack: nine 7-bit big-endian lanes, zero-padded on the
+            // right for ids shorter than nine bytes. Stop at the first pad.
+            for i in (0..9).rev() {
+                let c = ((k >> (7 * i)) & 0x7f) as u8;
+                if c == 0 {
+                    break;
+                }
+                out.push(c);
+            }
         } else {
             dec_key(k, out);
         }
     }
     #[inline]
     fn cmp(&self, a: u64, b: u64) -> Ordering {
-        if (a | b) & EXOTIC == 0 {
+        if (a | b) & EXOTIC == 0 && (a < 1 << 60) == (b < 1 << 60) {
             a.cmp(&b)
         } else {
             self.cmp_slow(a, b)
@@ -617,18 +662,20 @@ impl Exotic {
     }
 
     /// Key for a field inside a buffer ending at `lim`.
+    // The compact alphabet now includes '_', so the common u_/cl_/link ids of
+    // up to ten bytes pack losslessly and lock-free via scalar enc_key, which
+    // is what removes the mutex-guarded interner from the hot click path. Only
+    // ids with characters outside that 63-symbol alphabet fall to ascii9 (any
+    // 7-bit ASCII up to nine bytes) and finally to the interner.
     #[inline(always)]
-    fn key_in(&self, s: &[u8], lim: usize) -> u64 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if (s.as_ptr() as usize) + 16 <= lim {
-                if let Some(k) = unsafe { enc_key16(s) } {
-                    return k;
-                }
-                return self.intern(s);
-            }
+    fn key_in(&self, s: &[u8], _lim: usize) -> u64 {
+        if let Some(k) = enc_key(s) {
+            return k;
         }
-        self.key(s)
+        if let Some(key) = ascii9(s) {
+            return key;
+        }
+        self.intern(s)
     }
 }
 
