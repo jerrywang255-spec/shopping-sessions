@@ -24,3 +24,13 @@ jobs:
         run: cargo build --release --offline
       - name: Validate end-to-end correctness
         run: python3 tests/smoke.py target/release/ss
+      - name: Build original main baseline
+        run: |
+          git fetch origin main --depth=1
+          mkdir -p baseline/src
+          git show FETCH_HEAD:Cargo.toml > baseline/Cargo.toml
+          git show FETCH_HEAD:main.rs > baseline/src/main.rs
+          git show FETCH_HEAD:pq.rs > baseline/src/pq.rs
+          cargo build --manifest-path baseline/Cargo.toml --release --offline
+      - name: Compare baseline and V3 on synthetic input
+        run: python3 tests/compare_performance.py --baseline baseline/target/release/ss --candidate target/release/ss --events 200000 --clicks 100000 --repeats 3
