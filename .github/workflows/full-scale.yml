@@ -1,0 +1,47 @@
+name: Compare V3 at 20M event scale
+on:
+  push:
+    branches: ["optimization/full-scale"]
+  workflow_dispatch:
+
+jobs:
+  full-scale:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download the official competition generator
+        run: |
+          curl --fail --location --retry 3 --silent --show-error \
+            https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip \
+            -o generator.zip
+          unzip -q generator.zip -d generator-src
+      - name: Compile the generator
+        run: |
+          MANIFEST="$(find generator-src -name Cargo.toml | head -1)"
+          cargo build --manifest-path "$MANIFEST" --release --offline
+          echo "GENERATOR=$(dirname "$MANIFEST")/target/release/generate" >> "$GITHUB_ENV"
+      - name: Generate 20 million events and 5 million clicks
+        run: |
+          "$GENERATOR" --seed 29 --events 20000000 --clicks 5000000 --output /tmp/shopping-input
+          du -sh /tmp/shopping-input
+          df -h /tmp
+      - name: Install Parquet reader
+        run: python3 -m pip install --user pyarrow==23.0.0
+      - name: Build V3 and 256-person-partition candidate (same compiler)
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
+        run: |
+          mkdir -p src variants
+          cp main.rs src/main.rs
+          cp pq.rs src/pq.rs
+          cargo build --release --offline
+          cp target/release/ss variants/ss-original
+          sed "s/const P2_BITS: u32 = 10;/const P2_BITS: u32 = 8;/" main.rs > src/main.rs
+          cargo build --release --offline
+          cp target/release/ss variants/ss-p2-8
+      - name: Check exact outputs and compare median runtime
+        env:
+          DATA_DIR: /tmp/shopping-input
+        run: python3 experiments/full_scale.py
