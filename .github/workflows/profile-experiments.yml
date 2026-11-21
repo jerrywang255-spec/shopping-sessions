@@ -38,7 +38,17 @@ jobs:
           du -sh /tmp/shopping-input
       - name: Install Parquet output checker
         run: python3 -m pip install --user pyarrow==23.0.0
-      - name: Profile parser and sorting matrix
+      - name: Build all nine partition configurations
         run: |
-          python3 experiments/profile_matrix.py --candidate target/release/ss \
-            --data /tmp/shopping-input --repeats 4 --threads 4 --prefault 0 --parsers simd,short --sorts std --check
+          mkdir -p variants
+          for p1 in 8 10 12; do
+            for p2 in 8 10 12; do
+              sed -e "s/const P1_BITS: u32 = 10;/const P1_BITS: u32 = ${p1};/" \
+                  -e "s/const P2_BITS: u32 = 10;/const P2_BITS: u32 = ${p2};/" \
+                  main.rs > src/main.rs
+              cargo build --release --offline --quiet
+              cp target/release/ss "variants/ss-p1${p1}-p2${p2}"
+            done
+          done
+      - name: Compare partition settings against exact outputs
+        run: DATA_DIR=/tmp/shopping-input python3 experiments/partition_matrix.py
