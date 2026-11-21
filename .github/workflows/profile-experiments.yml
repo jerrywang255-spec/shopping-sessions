@@ -36,7 +36,9 @@ jobs:
         run: |
           "$GENERATOR" --seed 17 --events 3000000 --clicks 800000 --output /tmp/shopping-input
           du -sh /tmp/shopping-input
-      - name: Profile 12 runner configurations
+      - name: Install Parquet output checker
+        run: python3 -m pip install --user pyarrow==23.0.0
+      - name: Profile parser and sorting matrix
         run: |
           python3 experiments/profile_matrix.py --candidate target/release/ss \
-            --data /tmp/shopping-input --repeats 2 --threads 2,4,8 --prefault 0,1
+            --data /tmp/shopping-input --repeats 2 --threads 4,8 --prefault 0 --parsers simd,scalar --sorts std,radix --check
