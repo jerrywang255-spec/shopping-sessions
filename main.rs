@@ -8,7 +8,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -526,10 +526,15 @@ fn dec_key(k: u64, out: &mut Vec<u8>) {
 const INTERN_SHARD_BITS: u32 = 8;
 const INTERN_SHARDS: usize = 1 << INTERN_SHARD_BITS;
 
+struct InternedId {
+    bytes: Box<[u8]>,
+    next: Option<std::num::NonZeroUsize>,
+}
+
 #[derive(Default)]
 struct InternShard {
-    ids: HashMap<Arc<[u8]>, usize>,
-    bytes: Vec<Arc<[u8]>>,
+    heads: HashMap<u64, std::num::NonZeroUsize>,
+    entries: Vec<InternedId>,
 }
 
 /// Intern opaque IDs using exact byte equality and independent shard locks.
@@ -553,16 +558,25 @@ impl Exotic {
     }
     #[cold]
     fn intern(&self, s: &[u8]) -> u64 {
-        let shard = (self.hash.hash_one(s) as usize) & (INTERN_SHARDS - 1);
-        let mut entries = self.shards[shard].lock().unwrap();
-        let index = if let Some(&index) = entries.ids.get(s) {
-            index
-        } else {
-            let index = entries.bytes.len();
-            let bytes: Arc<[u8]> = Arc::from(s);
-            entries.bytes.push(Arc::clone(&bytes));
-            entries.ids.insert(bytes, index);
-            index
+        let hash = self.hash.hash_one(s);
+        let shard = hash as usize & (INTERN_SHARDS - 1);
+        let mut shard_data = self.shards[shard].lock().unwrap();
+        let head = shard_data.heads.get(&hash).copied();
+        let mut current = head;
+        let index = loop {
+            let Some(entry_index) = current else {
+                let index = shard_data.entries.len();
+                shard_data.entries.push(InternedId { bytes: s.into(), next: head });
+                shard_data.heads.insert(hash, std::num::NonZeroUsize::new(index + 1).unwrap());
+                break index;
+            };
+            let index = entry_index.get() - 1;
+            let entry = &shard_data.entries[index];
+            // The full byte string decides equality, even when hashes collide.
+            if entry.bytes.as_ref() == s {
+                break index;
+            }
+            current = entry.next;
         };
         EXOTIC | ((index as u64) << INTERN_SHARD_BITS) | shard as u64
     }
@@ -570,8 +584,8 @@ impl Exotic {
         if k & EXOTIC != 0 {
             let shard = k as usize & (INTERN_SHARDS - 1);
             let index = ((k & !EXOTIC) >> INTERN_SHARD_BITS) as usize;
-            let entries = self.shards[shard].lock().unwrap();
-            out.extend_from_slice(&entries.bytes[index]);
+            let shard_data = self.shards[shard].lock().unwrap();
+            out.extend_from_slice(&shard_data.entries[index].bytes);
         } else {
             dec_key(k, out);
         }
