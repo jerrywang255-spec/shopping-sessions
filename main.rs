@@ -1584,14 +1584,31 @@ struct Scratch<'a> {
     day_end: Vec<usize>,
 }
 
+#[inline(always)]
+fn person_slot(key: u64, mask: usize) -> usize {
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) as usize & mask
+}
+
+fn grow_person_index(table: &mut Vec<u32>, persons: &[u64]) {
+    let new_size = table.len() * 2;
+    table.clear();
+    table.resize(new_size, 0);
+    for (i, &key) in persons.iter().enumerate() {
+        let mut slot = person_slot(key, new_size - 1);
+        while table[slot] != 0 { slot = (slot + 1) & (new_size - 1); }
+        table[slot] = (i + 1) as u32;
+    }
+}
+
 fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>], p: usize, sc: &mut Scratch<'a>, agg: &mut Agg) {
     let n: usize = evs.iter().map(|t| t.count(p)).sum();
     if n == 0 {
         return;
     }
-    // local person index
-    let cap = (n * 2).next_power_of_two().max(64);
-    let mask = cap - 1;
+    // The previous partition estimates the number of distinct people. Grow
+    // on insertion if this partition needs more space.
+    let cap = (sc.persons.len().min(n) * 2).next_power_of_two().max(64);
+    let mut mask = cap - 1;
     sc.table.clear();
     sc.table.resize(cap, 0);
     sc.persons.clear();
@@ -1600,7 +1617,7 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
     for t in evs {
         t.each(p, |r| {
             let k = r.person;
-            let mut i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & mask;
+            let mut i = person_slot(k, mask);
             let l = loop {
                 let v = sc.table[i];
                 if v == 0 {
@@ -1608,6 +1625,10 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
                     sc.persons.push(k);
                     sc.cnt.push(0);
                     sc.table[i] = l + 1;
+                    if sc.persons.len() * 2 >= sc.table.len() {
+                        grow_person_index(&mut sc.table, &sc.persons);
+                        mask = sc.table.len() - 1;
+                    }
                     break l;
                 }
                 if sc.persons[(v - 1) as usize] == k {
@@ -1676,7 +1697,7 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
     for t in cls {
         t.each(p, |r| {
             let k = r.person;
-            let mut i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & mask;
+            let mut i = person_slot(k, mask);
             let l = loop {
                 let v = sc.table[i];
                 if v == 0 {
