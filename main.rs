@@ -214,38 +214,30 @@ fn emit_line<'a, const N: usize>(m: &'a [u8], line_start: usize, ends: &[usize; 
     emit(&f);
 }
 
-/// Like `emit_line`, with the line's quote mask (bit i = byte line_start+i is a quote).
-#[inline(always)]
-fn emit_line_q<'a, const N: usize>(m: &'a [u8], ls: usize, ends: &[usize; N], q0: u64, q1: u64, emit: &mut impl FnMut(&[&'a [u8]; N])) {
-    let mut f: [&[u8]; N] = [&[]; N];
-    let mut s = ls;
-    if (q0 | q1) == 0 {
-        for k in 0..N {
-            let t = ends[k];
-            f[k] = unsafe { m.get_unchecked(s..t) };
-            s = t + 1;
-        }
-    } else {
-        let qm = (q0 as u128) | ((q1 as u128) << 64);
-        let mut expect: u128 = 0;
-        for k in 0..N {
-            let t = ends[k];
-            let rs = s - ls;
-            let rt = t - ls;
-            let q = (((qm >> rs) & 1) as usize) & ((t > s) as usize);
-            // a quoted field needs length >= 2; its closing quote is at rt-1
-            let qq = q & ((t >= s + 2) as usize);
-            expect |= ((qq as u128) << rs) | ((qq as u128) << (rt.wrapping_sub(1) & 127));
-            let a = s + qq;
-            let z = t - qq;
-            f[k] = unsafe { m.get_unchecked(a..z) };
-            s = t + 1;
-        }
-        if expect != qm {
-            return;
-        }
+// Validate whole-field quoting for a row of up to 128 bytes. End bits
+// include the newline, so an empty final field still has a delimiter.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,popcnt")]
+unsafe fn quoted_fields(ends: u128, quotes: u128) -> Option<u32> {
+    use std::arch::x86_64::_pext_u64;
+    if quotes == 0 {
+        return Some(0);
     }
-    emit(&f);
+    let starts = (ends << 1) | 1;
+    let opening = starts & quotes;
+    let closing = (ends >> 1) & quotes;
+    // Every quote must occupy exactly one boundary. A lone quote occupies both.
+    if (quotes ^ opening) != closing {
+        return None;
+    }
+    let pack = |bits: u128, mask: u128| {
+        let low = mask as u64;
+        _pext_u64(bits as u64, low)
+            | (_pext_u64((bits >> 64) as u64, (mask >> 64) as u64) << low.count_ones())
+    };
+    let opened = pack(opening, starts);
+    let closed = pack(closing << 1, ends);
+    (opened == closed).then_some(opened as u32)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -373,7 +365,18 @@ unsafe fn scan_lines_avx512<'a, const N: usize>(m: &'a [u8], b: usize, e: usize,
             ends[N - 1] = s + pl;
             let q0 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a0, vq), pl as u32);
             let q1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a1, vq), pl.saturating_sub(64) as u32);
-            emit_line(m, s, &ends, q0.count_ones() + q1.count_ones(), emit);
+            let delimiters = c0 as u128 | ((c1 as u128) << 64) | (1u128 << pl);
+            let quotes = q0 as u128 | ((q1 as u128) << 64);
+            if let Some(quoted) = quoted_fields(delimiters, quotes) {
+                let mut fields: [&[u8]; N] = [&[]; N];
+                let mut start = s;
+                for k in 0..N {
+                    let trim = ((quoted >> k) & 1) as usize;
+                    fields[k] = m.get_unchecked(start + trim..ends[k] - trim);
+                    start = ends[k] + 1;
+                }
+                emit(&fields);
+            }
         }
         s += pl + 1;
     }
@@ -2236,6 +2239,34 @@ mod event_dedup_tests {
             let mut bytes = Vec::new();
             ex.bytes(key, &mut bytes);
             assert_eq!(bytes, id.as_bytes());
+        }
+    }
+
+    #[test]
+    fn simd_csv_matches_scalar_across_quote_and_chunk_boundaries() {
+        let mut data = b"first,second,third\n".to_vec();
+        for n in 0..140 {
+            let mut row = vec![b'x'; n];
+            row.extend_from_slice(b",a,");
+            for tail in [b"".as_slice(), b"\"\"", b"\"v\"", b"\"", b"\"v", b"v\"", b"\"v\"z", b"\"\"\""] {
+                data.extend_from_slice(&row);
+                data.extend_from_slice(tail);
+                data.push(b'\n');
+            }
+        }
+        data.extend_from_slice(b"\"end\",,\"x\"");
+        for chunk in [31, 127, 1024] {
+            let mut actual = Vec::new();
+            let mut expected = Vec::new();
+            for b in (0..data.len()).step_by(chunk) {
+                let e = (b + chunk).min(data.len());
+                scan_lines::<3>(&data, b, e, &mut |f| actual.push(*f));
+                for_lines(&data, b, e, |line| {
+                    let mut f = [&[][..]; 3];
+                    if fields(line, &mut f) { expected.push(f); }
+                });
+            }
+            assert_eq!(actual, expected);
         }
     }
 
