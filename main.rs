@@ -78,7 +78,7 @@ fn make_chunks(maps: &[&[u8]], target: usize) -> Vec<(usize, usize, usize)> {
 
 /// Iterate the lines starting in [b, e) of `m`, skipping the header line of the file.
 #[inline]
-fn for_lines(m: &[u8], b: usize, e: usize, mut f: impl FnMut(&[u8])) {
+fn for_lines<'a>(m: &'a [u8], b: usize, e: usize, mut f: impl FnMut(&'a [u8])) {
     let mut pos = if b == 0 {
         0
     } else {
@@ -149,7 +149,7 @@ fn fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
 /// SIMD line splitter: calls `emit` with the N unquoted fields of every well-formed line
 /// starting in [b, e) (skipping the file's header line). Malformed lines are skipped.
 #[inline(always)]
-fn scan_lines<const N: usize>(m: &[u8], b: usize, e: usize, emit: &mut impl FnMut(&[&[u8]; N])) {
+fn scan_lines<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, emit: &mut impl FnMut(&[&'a [u8]; N])) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("bmi2") {
@@ -250,7 +250,7 @@ fn emit_line_q<'a, const N: usize>(m: &'a [u8], ls: usize, ends: &[usize; N], q0
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
-unsafe fn scan_lines_avx2<const N: usize>(m: &[u8], b: usize, e: usize, emit: &mut impl FnMut(&[&[u8]; N])) {
+unsafe fn scan_lines_avx2<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, emit: &mut impl FnMut(&[&'a [u8]; N])) {
     use std::arch::x86_64::*;
     let len = m.len();
     let mut s = match first_line_start(m, b) {
@@ -324,7 +324,7 @@ unsafe fn scan_lines_avx2<const N: usize>(m: &[u8], b: usize, e: usize, emit: &m
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx2,bmi1,bmi2,popcnt")]
-unsafe fn scan_lines_avx512<const N: usize>(m: &[u8], b: usize, e: usize, emit: &mut impl FnMut(&[&[u8]; N])) {
+unsafe fn scan_lines_avx512<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, emit: &mut impl FnMut(&[&'a [u8]; N])) {
     use std::arch::x86_64::*;
     let len = m.len();
     let mut s = match first_line_start(m, b) {
@@ -569,7 +569,7 @@ mod intern_tests {
         let ids = [
             &b"e00112233445566778899aabbccddeeff"[..],
             &b"e00112233445566778899aabbccddeefF"[..],
-            "id-λ".as_bytes(),
+            "id-Î»".as_bytes(),
         ];
         for (index, id) in ids.iter().enumerate() {
             assert_eq!(shard.intern(42, id), index);
@@ -1204,7 +1204,32 @@ struct EvRec {
     ts: u32,     // ms since base (window_start - 7 days)
     ingest: u32, // epoch seconds (saturated)
     pc: u32,     // price (24 bits) | cat << 24
-    ok: u32,
+    // Zero for compact IDs. Long IDs use a one-based index in this worker's input slices.
+    opaque_index: u32,
+}
+
+struct EventBatch<'a> {
+    records: Parts<EvRec>,
+    opaque_ids: Vec<&'a [u8]>,
+}
+
+impl<'a> EventBatch<'a> {
+    fn alloc(count_per_part: usize, partitions: usize) -> Self {
+        Self { records: Parts::alloc(count_per_part, partitions), opaque_ids: Vec::new() }
+    }
+
+    fn key(&mut self, ex: &Exotic, id: &'a [u8], limit: usize) -> (u64, u32) {
+        if id.len() <= 10 {
+            return (ex.event_key(id, limit), 0);
+        }
+        self.opaque_ids.push(id);
+        let index = u32::try_from(self.opaque_ids.len()).expect("too many long IDs in one worker");
+        (ex.hash.hash_one(id), index)
+    }
+
+    fn opaque_id(&self, index: u32) -> Option<&[u8]> {
+        index.checked_sub(1).map(|i| self.opaque_ids[i as usize])
+    }
 }
 
 /// An event (user or person key, ts, price|cat).
@@ -1284,7 +1309,7 @@ fn parse_price(s: &[u8]) -> u32 {
     v as u32
 }
 
-fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, e: usize, out: &mut Parts<EvRec>) {
+fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: usize, e: usize, out: &mut EventBatch<'a>) {
     let base = ctx.base;
     let lo = ctx.ws;
     let hi = ctx.we;
@@ -1293,7 +1318,7 @@ fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
         if f[0].is_empty() {
             return;
         }
-        let eid = ex.event_key(f[0], lim);
+        let (eid, opaque_index) = out.key(ex, f[0], lim);
         let ingest_ms = parse_ts_fast(f[3], dc).unwrap_or(i64::MAX / 4);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
         let mut ok = !f[1].is_empty() && !f[5].is_empty();
@@ -1333,11 +1358,11 @@ fn parse_events(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &[u8], b: usize, 
                 let category = ctx.prods.get(f[5]).map(u32::from).unwrap_or(ctx.unknown_cat);
                 price | (category << 24)
             };
-            EvRec { eid, user, ts: (ts - base) as u32, ingest, pc, ok: 1 }
+            EvRec { eid, user, ts: (ts - base) as u32, ingest, pc, opaque_index }
         } else {
-            EvRec { eid, user: 0, ts: 0, ingest, pc: 0, ok: 0 }
+            EvRec { eid, user: 0, ts: 0, ingest, pc: 0, opaque_index }
         };
-        out.push(part1(eid), rec);
+        out.records.push(part1(eid), rec);
     });
 }
 
@@ -1396,11 +1421,11 @@ fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache,
 struct DedupScratch<'a> {
     // Each word tracks 64 hash buckets. The second mask flags buckets visited twice.
     buckets: Vec<[u64; 2]>,
-    winners: Vec<Option<&'a EvRec>>,
+    winners: Vec<Option<(&'a EvRec, usize)>>,
 }
 
-fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>) {
-    let n: usize = parts.iter().map(|part| part.count(p)).sum();
+fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [EventBatch<'_>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>) {
+    let n: usize = parts.iter().map(|part| part.records.count(p)).sum();
     if n == 0 {
         return;
     }
@@ -1409,7 +1434,7 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: 
     scratch.buckets.resize(buckets / 64, [0, 0]);
     let hash = |eid: u64| eid.wrapping_mul(0x9E37_79B9_7F4A_7C15) << P1_BITS;
     let shift = 64 - buckets.trailing_zeros();
-    let records = || parts.iter().flat_map(|part| part.main(p).iter().chain(&part.spill[p]));
+    let records = || parts.iter().flat_map(|part| part.records.main(p).iter().chain(&part.records.spill[p]));
     let mut collisions = 0usize;
     for record in records() {
         let index = (hash(record.eid) >> shift) as usize;
@@ -1428,15 +1453,16 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: 
     scratch.winners.resize(capacity, None);
     let table_shift = 64 - capacity.trailing_zeros();
     let mut emit = |r: &EvRec| {
-        if r.ok != 0 {
+        // All nonempty user IDs encode to a nonzero key. Invalid rows carry zero.
+        if r.user != 0 {
             let person = lm.get(r.user);
             out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
         }
     };
     // Identity lookups are random reads of a large table; prefetch a fixed distance ahead.
     const AHEAD: usize = 16;
-    for part in parts {
-        for run in [part.main(p), &part.spill[p][..]] {
+    for (batch_index, batch) in parts.iter().enumerate() {
+        for run in [batch.records.main(p), &batch.records.spill[p][..]] {
             for (i, record) in run.iter().enumerate() {
                 if let Some(next) = run.get(i + AHEAD) {
                     lm.prefetch(next.user);
@@ -1451,12 +1477,13 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: 
                 loop {
                     match scratch.winners[slot] {
                         None => {
-                            scratch.winners[slot] = Some(record);
+                            scratch.winners[slot] = Some((record, batch_index));
                             break;
                         }
-                        Some(previous) if previous.eid == record.eid => {
+                        Some((previous, owner)) if previous.eid == record.eid
+                            && parts[owner].opaque_id(previous.opaque_index) == batch.opaque_id(record.opaque_index) => {
                             if record.ingest < previous.ingest {
-                                scratch.winners[slot] = Some(record);
+                                scratch.winners[slot] = Some((record, batch_index));
                             }
                             break;
                         }
@@ -1466,7 +1493,7 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [Parts<EvRec>], p: usize, scratch: 
             }
         }
     }
-    for winner in scratch.winners.iter().flatten() {
+    for (winner, _) in scratch.winners.iter().flatten() {
         emit(winner);
     }
 }
@@ -1935,7 +1962,7 @@ fn main() {
     let cl_cap = est_cl * 5 / 4 / nthreads / P2 + 32;
     let pr_cap = est_ev * 5 / 4 / nthreads / P2 + 32;
     let parse = || {
-        let mut evp = Parts::<EvRec>::alloc(ev_cap, P1);
+        let mut evp = EventBatch::alloc(ev_cap, P1);
         let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
         let mut dc = DateCache::new();
         loop {
@@ -1953,7 +1980,7 @@ fn main() {
         }
         (evp,clp)
     };
-    let parsed: Vec<(Parts<EvRec>, Parts<CRec>)> = std::thread::scope(|scope| {
+    let parsed: Vec<(EventBatch<'_>, Parts<CRec>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (1..nthreads).map(|_| scope.spawn(&parse)).collect();
         // Other workers can parse events while the calling thread resolves identities.
         std::sync::LazyLock::force(&lm);
@@ -2082,10 +2109,10 @@ fn bench(data: &Path, mode: &str) {
         let mut dc = DateCache::new();
         let total: usize = ev_maps.iter().map(|m| m.len()).sum();
         let t = std::time::Instant::now();
-        let mut evp: Parts<EvRec> = Parts::alloc(total / 80 * 5 / 4 / P1 + 32, P1);
+        let mut evp = EventBatch::alloc(total / 80 * 5 / 4 / P1 + 32, P1);
         eprintln!("alloc {:?}", t.elapsed());
-        for m in &ev_maps { parse_events(&ctx, &ex, &mut dc, m, 0, m.len(), &mut evp); if mode == "parse_np" { evp.clear(); } }
-        eprintln!("{} {:?} n={}", mode, t.elapsed(), (0..P1).map(|p| evp.count(p)).sum::<usize>());
+        for m in &ev_maps { parse_events(&ctx, &ex, &mut dc, m, 0, m.len(), &mut evp); if mode == "parse_np" { evp.records.clear(); evp.opaque_ids.clear(); } }
+        eprintln!("{} {:?} n={}", mode, t.elapsed(), (0..P1).map(|p| evp.records.count(p)).sum::<usize>());
         return;
     }
     let ev_maps: Vec<&[u8]> = csv_files(&data.join("events")).iter().map(|p| map_file(p)).collect();
@@ -2178,15 +2205,20 @@ mod event_dedup_tests {
         let bucket = |key: u64| key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - P1_BITS - 6);
         let ids: Vec<_> = (1u64..).filter(|&key| bucket(key) == 0).take(3).collect();
         let singleton = (1u64..).find(|&key| bucket(key) == 1).unwrap();
-        let event = |eid, user, ingest, ok| EvRec { eid, user, ts: 1, ingest, pc: 0, ok };
-        let mut a = Parts::alloc(1, 1);
-        let mut b = Parts::alloc(1, 1);
-        a.push(0, event(ids[0], 11, 2, 1));
-        a.push(0, event(ids[1], 22, 5, 1));
-        a.push(0, event(singleton, 33, 1, 1));
-        b.push(0, event(ids[0], 44, 1, 1));
-        b.push(0, event(ids[1], 55, 3, 0));
-        b.push(0, event(ids[2], 66, 1, 1));
+        let event = |eid, user, ingest, opaque_index| EvRec { eid, user, ts: 1, ingest, pc: 0, opaque_index };
+        let mut a = EventBatch::alloc(1, 1);
+        let mut b = EventBatch::alloc(1, 1);
+        a.opaque_ids.push(b"same-long-event");
+        b.opaque_ids.extend([b"distinct-long-event".as_slice(), b"same-long-event".as_slice()]);
+        a.records.push(0, event(ids[0], 11, 2, 1));
+        a.records.push(0, event(ids[1], 22, 5, 0));
+        a.records.push(0, event(singleton, 33, 1, 0));
+        b.records.push(0, event(ids[0], 44, 1, 2));
+        // Force the same fingerprint for two distinct long IDs and a compact ID.
+        b.records.push(0, event(ids[0], 77, 1, 1));
+        b.records.push(0, event(ids[0], 88, 1, 0));
+        b.records.push(0, event(ids[1], 0, 3, 0));
+        b.records.push(0, event(ids[2], 66, 1, 0));
         let inputs = [a, b];
         let mut scratch = DedupScratch::default();
         let mut out = Parts::alloc(1, P2);
@@ -2196,7 +2228,7 @@ mod event_dedup_tests {
             out.each(p, |r| users.push(r.person));
         }
         users.sort_unstable();
-        assert_eq!(users, [33, 44, 66]);
+        assert_eq!(users, [33, 44, 66, 77, 88]);
     }
 
     #[test]
