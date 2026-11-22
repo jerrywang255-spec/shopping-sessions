@@ -864,14 +864,12 @@ fn parse_dt(s: &[u8]) -> Option<i64> {
 
 /// Per-thread cache of validated dates ("YYYY-MM-DD" -> epoch ms of midnight).
 struct DateCache {
-    k1: [u64; 64],
-    k2: [u16; 64],
-    v: [i64; 64],
+    entries: [(u64, u16, i64); 64],
 }
 const BAD_DATE: i64 = i64::MIN;
 impl DateCache {
     fn new() -> Self {
-        DateCache { k1: [0; 64], k2: [0; 64], v: [BAD_DATE; 64] }
+        DateCache { entries: [(0, 0, BAD_DATE); 64] }
     }
     #[cold]
     fn fill(&mut self, s: &[u8], h: usize, k1: u64, k2: u16) -> i64 {
@@ -888,9 +886,7 @@ impl DateCache {
             Some(days_from_civil(y, mo, d) * DAY_MS)
         })()
         .unwrap_or(BAD_DATE);
-        self.k1[h] = k1;
-        self.k2[h] = k2;
-        self.v[h] = v;
+        self.entries[h] = (k1, k2, v);
         v
     }
 }
@@ -927,6 +923,20 @@ mod epoch_tests {
     use super::epoch13;
 
     #[test]
+    fn iso_fast_path_matches_scalar_validation() {
+        let mut cache = super::DateCache::new();
+        for sample in [b"2028-02-29T23:59:59Z".as_slice(), b"2027-03-01T00:00:00+12:30"] {
+            for i in 0..sample.len() {
+                for byte in 0..=255 {
+                    let mut field = sample.to_vec();
+                    field[i] = byte;
+                    assert_eq!(super::parse_ts_fast(&field, &mut cache), super::parse_ts(&field), "{field:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decimal_timestamp_matches_scalar_parsing() {
         for sample in [b"0000000000000", b"0123456789012", b"9999999999999"] {
             for position in 0..sample.len() {
@@ -952,36 +962,30 @@ fn parse_ts_fast(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     if (n == 20 || n == 25) && s[4] == b'-' {
         let k1 = u64::from_le_bytes(s[0..8].try_into().unwrap());
         let k2 = u16::from_le_bytes(s[8..10].try_into().unwrap());
-        let h = ((k1 ^ ((k2 as u64) << 21)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
-        let mut dms = dc.v[h];
-        if dc.k1[h] != k1 || dc.k2[h] != k2 || dms == BAD_DATE {
-            if dc.k1[h] == k1 && dc.k2[h] == k2 {
-                return None;
-            }
-            dms = dc.fill(s, h, k1, k2);
-            if dms == BAD_DATE {
-                return None;
-            }
-        }
-        if s[10] != b'T' {
+        // Keep distinct days in a month in distinct slots. Compare all ten
+        // date bytes before using a cached midnight, including on month rollover.
+        let h = ((k2 as usize & 3) << 4) | (k2 as usize >> 8 & 15);
+        let (prefix, day, cached) = dc.entries[h];
+        let dms = if prefix == k1 && day == k2 { cached } else { dc.fill(s, h, k1, k2) };
+        if dms == BAD_DATE || s[10] != b'T' {
             return None;
         }
         let t = u64::from_le_bytes(s[11..19].try_into().unwrap());
-        if t & !TM != TCOLON {
+        let digits = t ^ ((D30 & TM) | TCOLON);
+        if digits & !TM != 0 || (digits | digits.wrapping_add(D06 & TM)) & DF0 != 0 {
             return None;
         }
-        let x = t & TM;
-        if x & (DF0 & TM) != (D30 & TM) || (x.wrapping_add(D06 & TM)) & (DF0 & TM) != (D30 & TM) {
+        // Reduce HH, MM and SS in three independent byte lanes.
+        const ONES: u64 = 1 | (1 << 24) | (1 << 48);
+        const LANES: u64 = ONES * 255;
+        let pairs = (digits & LANES) * 10 + ((digits >> 8) & LANES);
+        let limits = 104 | (68 << 24) | (68 << 48);
+        if (pairs + limits) & (ONES * 128) != 0 {
             return None;
         }
-        let v = x.wrapping_sub(D30 & TM);
-        let b = |i: u32| ((v >> (8 * i)) & 0xFF) as i64;
-        let hh = b(0) * 10 + b(1);
-        let mi = b(3) * 10 + b(4);
-        let se = b(6) * 10 + b(7);
-        if hh > 23 || mi > 59 || se > 59 {
-            return None;
-        }
+        let hh = (pairs & 255) as i64;
+        let mi = ((pairs >> 24) & 255) as i64;
+        let se = (pairs >> 48) as i64;
         let mut ms = dms + (hh * 3600 + mi * 60 + se) * 1000;
         if n == 20 {
             if s[19] != b'Z' {
