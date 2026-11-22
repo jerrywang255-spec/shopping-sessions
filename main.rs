@@ -1582,6 +1582,7 @@ struct Scratch<'a> {
     ctmp: Vec<(u32, u32)>,
     catrev: Vec<u64>,
     day_end: Vec<usize>,
+    assist_marks: Vec<usize>,
 }
 
 fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>], p: usize, sc: &mut Scratch<'a>, agg: &mut Agg) {
@@ -1731,7 +1732,8 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
                     if group[end].cid < group[best].cid { best = end; }
                     end += 1;
                 }
-                group.swap(i, best);
+                // The attribution cursor stops just after the tied clicks.
+                group.swap(end - 1, best);
                 i = end;
             }
         }
@@ -1746,6 +1748,9 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
     if sc.day_end.len() != nd + 1 {
         sc.day_end = vec![0; nd + 1];
     }
+    sc.assist_marks.clear();
+    sc.assist_marks.resize(ctx.ncamp, 0);
+    let mut session_number = 0usize;
     let day_of = |start: u32| -> u32 { (floor_div(base + start as i64, DAY_MS) - ctx.day0) as u32 };
     for l in 0..np {
         let person = sc.persons[l];
@@ -1799,11 +1804,7 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
                 let hi = cp - 1;
                 let t = clicks[hi].ts;
                 if (start - t) as i64 <= WEEK_MS {
-                    let mut q = hi;
-                    while q > 0 && clicks[q - 1].ts == t {
-                        q -= 1;
-                    }
-                    camp = clicks[q].camp as usize;
+                    camp = clicks[hi].camp as usize;
                 }
             }
             let st = &mut agg.camp[camp * nd + day as usize];
@@ -1815,7 +1816,26 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
             ses.push(Ses { start, day });
         }
         finish_row(&mut row, catrev, &mut agg.rows);
-        if !clicks.is_empty() {
+        // For small groups, count the distinct campaigns directly in each
+        // session's inclusive time window. Large groups still use merged intervals.
+        if !clicks.is_empty() && clicks.len() <= 64 / ses.len() {
+            let mut lo = 0;
+            let mut hi = 0;
+            for session in ses.iter() {
+                let earliest = session.start.saturating_sub(WEEK_MS as u32);
+                while lo < clicks.len() && clicks[lo].ts < earliest { lo += 1; }
+                hi = hi.max(lo);
+                while hi < clicks.len() && clicks[hi].ts <= session.start { hi += 1; }
+                session_number += 1;
+                for click in &clicks[lo..hi] {
+                    let campaign = click.camp as usize;
+                    if sc.assist_marks[campaign] != session_number {
+                        sc.assist_marks[campaign] = session_number;
+                        agg.camp[campaign * nd + session.day as usize][3] += 1;
+                    }
+                }
+            }
+        } else if !clicks.is_empty() {
             let day_end = &mut sc.day_end;
             let mut s = 0usize;
             for d in 0..nd {
