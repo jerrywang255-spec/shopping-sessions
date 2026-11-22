@@ -3,11 +3,12 @@ mod pq;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -522,13 +523,26 @@ fn dec_key(k: u64, out: &mut Vec<u8>) {
     }
 }
 
-/// Interner for IDs that do not fit the compact encoding (rare).
+const INTERN_SHARD_BITS: u32 = 8;
+const INTERN_SHARDS: usize = 1 << INTERN_SHARD_BITS;
+
+#[derive(Default)]
+struct InternShard {
+    ids: HashMap<Arc<[u8]>, usize>,
+    bytes: Vec<Arc<[u8]>>,
+}
+
+/// Intern opaque IDs using exact byte equality and independent shard locks.
 struct Exotic {
-    inner: Mutex<(HashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>,
+    hash: RandomState,
+    shards: Box<[Mutex<InternShard>]>,
 }
 impl Exotic {
     fn new() -> Self {
-        Exotic { inner: Mutex::new((HashMap::new(), Vec::new())) }
+        Exotic {
+            hash: RandomState::new(),
+            shards: (0..INTERN_SHARDS).map(|_| Mutex::new(InternShard::default())).collect(),
+        }
     }
     #[inline]
     fn key(&self, s: &[u8]) -> u64 {
@@ -539,19 +553,25 @@ impl Exotic {
     }
     #[cold]
     fn intern(&self, s: &[u8]) -> u64 {
-        let mut g = self.inner.lock().unwrap();
-        if let Some(&k) = g.0.get(s) {
-            return k;
-        }
-        let k = EXOTIC | g.1.len() as u64;
-        g.1.push(s.to_vec());
-        g.0.insert(s.to_vec(), k);
-        k
+        let shard = (self.hash.hash_one(s) as usize) & (INTERN_SHARDS - 1);
+        let mut entries = self.shards[shard].lock().unwrap();
+        let index = if let Some(&index) = entries.ids.get(s) {
+            index
+        } else {
+            let index = entries.bytes.len();
+            let bytes: Arc<[u8]> = Arc::from(s);
+            entries.bytes.push(Arc::clone(&bytes));
+            entries.ids.insert(bytes, index);
+            index
+        };
+        EXOTIC | ((index as u64) << INTERN_SHARD_BITS) | shard as u64
     }
     fn bytes(&self, k: u64, out: &mut Vec<u8>) {
         if k & EXOTIC != 0 {
-            let g = self.inner.lock().unwrap();
-            out.extend_from_slice(&g.1[(k & !EXOTIC) as usize]);
+            let shard = k as usize & (INTERN_SHARDS - 1);
+            let index = ((k & !EXOTIC) >> INTERN_SHARD_BITS) as usize;
+            let entries = self.shards[shard].lock().unwrap();
+            out.extend_from_slice(&entries.bytes[index]);
         } else {
             dec_key(k, out);
         }
