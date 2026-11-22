@@ -2825,7 +2825,9 @@ mod event_dedup_tests {
         let inputs = [a, b];
         let mut scratch = DedupScratch::default();
         let mut out = Parts::alloc(1, P2);
-        dedup_direct(&LinkMap::empty(), &inputs, 0, &mut scratch, &mut out);
+        let mut wc = Wc::new(P2);
+        dedup_direct(&LinkMap::empty(), &inputs, 0, &mut scratch, &mut out, &mut wc);
+        wc.finish(&mut out);
         let mut users = Vec::new();
         for p in 0..P2 {
             out.each(p, |r| users.push(r.person));
