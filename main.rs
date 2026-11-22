@@ -2639,6 +2639,10 @@ fn main() {
     let ev_cap = est_ev * 5 / 4 / nthreads / P1 + 32;
     let cl_cap = est_cl * 5 / 4 / nthreads / P2 + 32;
     let pr_cap = est_ev * 5 / 4 / nthreads / P2 + 32;
+    // SEQMAP: map users to persons in a separate pass over user partitions, where each partition
+    // touches one small region of the link map (no random reads of the whole table).
+    let seqmap = std::env::var_os("SS_FUSEDMAP").is_none();
+    let no_links = LinkMap::empty();
     let parse = || {
         let mut evp = EventBatch::alloc(ev_cap, P1);
         let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
@@ -2651,7 +2655,7 @@ fn main() {
         }
         evp.wc.finish(&mut evp.records);
         evp.wc2.finish(&mut evp.compact);
-        let ids = std::sync::LazyLock::force(&lm);
+        let ids = if seqmap { &no_links } else { std::sync::LazyLock::force(&lm) };
         loop {
             let k = cl_next.fetch_add(1, AO::Relaxed);
             if k >= cl_chunks.len() { break; }
@@ -2680,7 +2684,7 @@ fn main() {
             loop {
                 let p=p_next.fetch_add(1,AO::Relaxed);
                 if p >= P1 {break;}
-                dedup_direct(lm,&ev_parts,p,&mut scratch,&mut out,&mut wc);
+                dedup_direct(if seqmap { &no_links } else { lm },&ev_parts,p,&mut scratch,&mut out,&mut wc);
                 // this partition's event blocks are free now: recycle them for the output
                 for b in ev_parts.iter() {
                     unsafe { (*(&b.records as *const Parts<EvRec> as *mut Parts<EvRec>)).release(p, out.pool) };
@@ -2694,6 +2698,39 @@ fn main() {
     });
     drop(ev_parts);
     tick("dedup => final person shards");
+    let (pe_parts, pc_parts) = if seqmap {
+        let q_next = AtomicUsize::new(0);
+        let mapped: Vec<(Parts<PRec>, Parts<CRec>)> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..nthreads).map(|_| s.spawn(|| {
+                let mut eo = Parts::<PRec>::alloc(1, P2);
+                let mut co = Parts::<CRec>::alloc(1, P2);
+                loop {
+                    let q = q_next.fetch_add(1, AO::Relaxed);
+                    if q >= P2 { break; }
+                    for t in pe_parts.iter() {
+                        t.each(q, |r| {
+                            let person = lm.get(r.person);
+                            eo.push(part2(person), PRec { person, ..*r });
+                        });
+                        unsafe { (*(t as *const Parts<PRec> as *mut Parts<PRec>)).release(q, eo.pool) };
+                    }
+                    for t in pc_parts.iter() {
+                        t.each(q, |r| {
+                            let person = lm.get(r.person);
+                            co.push(part2(person), CRec { person, ..*r });
+                        });
+                        unsafe { (*(t as *const Parts<CRec> as *mut Parts<CRec>)).release(q, co.pool) };
+                    }
+                }
+                (eo, co)
+            })).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        tick("map users to persons");
+        mapped.into_iter().unzip()
+    } else {
+        (pe_parts, pc_parts)
+    };
 
     // ---------------- stage 4: sessions, attribution, aggregation, user output
     let ud_dir = outdir.join("user_daily");
