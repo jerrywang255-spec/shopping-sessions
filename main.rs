@@ -153,7 +153,11 @@ fn scan_lines<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, emit: &mut im
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("bmi2") {
-            unsafe { scan_lines_avx512::<N>(m, b, e, emit) };
+            if is_x86_feature_detected!("avx512vbmi2") {
+                unsafe { scan_lines_compressed::<N>(m, b, e, emit) };
+            } else {
+                unsafe { scan_lines_avx512::<N>(m, b, e, emit) };
+            }
             return;
         }
         if is_x86_feature_detected!("avx2") {
@@ -317,6 +321,18 @@ unsafe fn scan_lines_avx2<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, e
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx2,bmi1,bmi2,popcnt")]
 unsafe fn scan_lines_avx512<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, emit: &mut impl FnMut(&[&'a [u8]; N])) {
+    scan_avx512_rows::<N, false>(m, b, e, emit)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,avx2,bmi1,bmi2,popcnt")]
+unsafe fn scan_lines_compressed<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, emit: &mut impl FnMut(&[&'a [u8]; N])) {
+    scan_avx512_rows::<N, true>(m, b, e, emit)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn scan_avx512_rows<'a, const N: usize, const COMPRESS: bool>(m: &'a [u8], b: usize, e: usize, emit: &mut impl FnMut(&[&'a [u8]; N])) {
     use std::arch::x86_64::*;
     let len = m.len();
     let mut s = match first_line_start(m, b) {
@@ -353,14 +369,34 @@ unsafe fn scan_lines_avx512<'a, const N: usize>(m: &'a [u8], b: usize, e: usize,
         let c0 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a0, vc), pl as u32);
         let c1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a1, vc), pl.saturating_sub(64) as u32);
         if (c0.count_ones() + c1.count_ones()) as usize == N - 1 {
-            let mut x0 = c0;
-            let mut x1 = c1;
-            for k in 0..N - 1 {
-                let z0 = x0 == 0;
-                let pos = if z0 { 64 + x1.trailing_zeros() as usize } else { x0.trailing_zeros() as usize };
-                ends[k] = s + pos;
-                x0 &= x0.wrapping_sub(1);
-                x1 = if z0 { x1 & x1.wrapping_sub(1) } else { x1 };
+            if COMPRESS && N <= 8 {
+                // Compact the selected byte offsets in parallel. A valid row has
+                // at most seven commas here, so the packed offsets fit in a u64.
+                const OFFSETS: [u8; 64] = {
+                    let mut bytes = [0; 64];
+                    let mut i = 0;
+                    while i < 64 { bytes[i] = i as u8; i += 1; }
+                    bytes
+                };
+                let low = _mm512_loadu_si512(OFFSETS.as_ptr().cast());
+                let high = _mm512_add_epi8(low, _mm512_set1_epi8(64));
+                let lo = _mm512_maskz_compress_epi8(c0, low);
+                let hi = _mm512_maskz_compress_epi8(c1, high);
+                let packed = _mm_cvtsi128_si64(_mm512_castsi512_si128(lo)) as u64
+                    | ((_mm_cvtsi128_si64(_mm512_castsi512_si128(hi)) as u64) << (8 * c0.count_ones()));
+                for k in 0..N - 1 {
+                    ends[k] = s + ((packed >> (8 * k)) & 255) as usize;
+                }
+            } else {
+                let mut x0 = c0;
+                let mut x1 = c1;
+                for k in 0..N - 1 {
+                    let z0 = x0 == 0;
+                    let pos = if z0 { 64 + x1.trailing_zeros() as usize } else { x0.trailing_zeros() as usize };
+                    ends[k] = s + pos;
+                    x0 &= x0.wrapping_sub(1);
+                    x1 = if z0 { x1 & x1.wrapping_sub(1) } else { x1 };
+                }
             }
             ends[N - 1] = s + pl;
             let q0 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a0, vq), pl as u32);
