@@ -528,33 +528,57 @@ const INTERN_SHARDS: usize = 1 << INTERN_SHARD_BITS;
 
 struct InternedId {
     bytes: Box<[u8]>,
-    next: Option<std::num::NonZeroUsize>,
+    hash: u64,
 }
 
 #[derive(Default)]
 struct InternShard {
-    heads: HashMap<u64, std::num::NonZeroUsize>,
+    // A zero slot is empty. Other slots hold a one-based index into entries.
+    slots: Vec<usize>,
     entries: Vec<InternedId>,
 }
 
 impl InternShard {
-    fn intern(&mut self, hash: u64, s: &[u8]) -> usize {
-        let head = self.heads.get(&hash).copied();
-        let mut current = head;
+    fn probe(&self, hash: u64, s: &[u8]) -> Result<usize, usize> {
+        let mask = self.slots.len() - 1;
+        let mut slot = (hash >> INTERN_SHARD_BITS) as usize & mask;
         loop {
-            let Some(entry_index) = current else {
-                let index = self.entries.len();
-                self.entries.push(InternedId { bytes: s.into(), next: head });
-                self.heads.insert(hash, std::num::NonZeroUsize::new(index + 1).unwrap());
-                break index;
-            };
-            let index = entry_index.get() - 1;
-            let entry = &self.entries[index];
-            // The full byte string decides equality, even when hashes collide.
-            if entry.bytes.as_ref() == s {
-                break index;
+            let index = self.slots[slot];
+            if index == 0 {
+                return Err(slot);
             }
-            current = entry.next;
+            let entry = &self.entries[index - 1];
+            if entry.hash == hash && entry.bytes.as_ref() == s {
+                return Ok(index - 1);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let size = (self.slots.len() * 2).max(16);
+        self.slots = vec![0; size];
+        for (i, entry) in self.entries.iter().enumerate() {
+            let mut slot = (entry.hash >> INTERN_SHARD_BITS) as usize & (size - 1);
+            while self.slots[slot] != 0 {
+                slot = (slot + 1) & (size - 1);
+            }
+            self.slots[slot] = i + 1;
+        }
+    }
+
+    fn intern(&mut self, hash: u64, s: &[u8]) -> usize {
+        if self.entries.len() * 4 >= self.slots.len() * 3 {
+            self.grow();
+        }
+        match self.probe(hash, s) {
+            Ok(index) => index,
+            Err(slot) => {
+                let index = self.entries.len();
+                self.entries.push(InternedId { bytes: s.into(), hash });
+                self.slots[slot] = index + 1;
+                index
+            }
         }
     }
 }
@@ -585,14 +609,24 @@ mod intern_tests {
 struct Exotic {
     hash: RandomState,
     shards: Box<[Mutex<InternShard>]>,
+    linked: Vec<InternShard>,
 }
 impl Exotic {
     fn new() -> Self {
         Exotic {
             hash: RandomState::new(),
+            linked: Vec::new(),
             shards: (0..INTERN_SHARDS).map(|_| Mutex::new(InternShard::default())).collect(),
         }
     }
+    // The link pass establishes a stable prefix of each shard's ID space.
+    // Event and click workers can read that prefix without taking a lock.
+    fn freeze_links(&mut self) {
+        self.linked = self.shards.iter_mut()
+            .map(|shard| std::mem::take(shard.get_mut().unwrap()))
+            .collect();
+    }
+
     #[inline]
     fn key(&self, s: &[u8]) -> u64 {
         match enc_key(s) {
@@ -604,16 +638,30 @@ impl Exotic {
     fn intern(&self, s: &[u8]) -> u64 {
         let hash = self.hash.hash_one(s);
         let shard = hash as usize & (INTERN_SHARDS - 1);
+        let prefix = self.linked.get(shard);
+        if let Some(frozen) = prefix {
+            if !frozen.slots.is_empty() {
+                if let Ok(index) = frozen.probe(hash, s) {
+                    return EXOTIC | ((index as u64) << INTERN_SHARD_BITS) | shard as u64;
+                }
+            }
+        }
         let mut shard_data = self.shards[shard].lock().unwrap();
-        let index = shard_data.intern(hash, s);
+        let index = prefix.map_or(0, |p| p.entries.len()) + shard_data.intern(hash, s);
         EXOTIC | ((index as u64) << INTERN_SHARD_BITS) | shard as u64
     }
     fn bytes(&self, k: u64, out: &mut Vec<u8>) {
         if k & EXOTIC != 0 {
             let shard = k as usize & (INTERN_SHARDS - 1);
             let index = ((k & !EXOTIC) >> INTERN_SHARD_BITS) as usize;
-            let shard_data = self.shards[shard].lock().unwrap();
-            out.extend_from_slice(&shard_data.entries[index].bytes);
+            let prefix = self.linked.get(shard);
+            if let Some(entry) = prefix.and_then(|p| p.entries.get(index)) {
+                out.extend_from_slice(&entry.bytes);
+            } else {
+                let index = index - prefix.map_or(0, |p| p.entries.len());
+                let shard_data = self.shards[shard].lock().unwrap();
+                out.extend_from_slice(&shard_data.entries[index].bytes);
+            }
         } else {
             dec_key(k, out);
         }
@@ -1926,7 +1974,7 @@ fn main() {
     for (i,(c,_)) in camp_rows.iter().enumerate() { camps.insert(c,i as u16); }
     let ncamp = camp_rows.len();
     let ctx = Ctx { base, ws, we, day0, nd, ncat: cats.len(), ncamp, prods, camps, unknown_cat };
-    let ex = Exotic::new();
+    let mut ex = Exotic::new();
     let ev_maps: Vec<&[u8]> = csv_files(&data.join("events")).iter().map(|p| map_file(p)).collect();
     let cl_maps: Vec<&[u8]> = csv_files(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
     let ln_maps: Vec<&[u8]> = csv_files(&data.join("links")).iter().map(|p| map_file(p)).collect();
@@ -1950,6 +1998,7 @@ fn main() {
         })).collect();
         hs.into_iter().map(|h|h.join().unwrap()).collect()
     });
+    ex.freeze_links();
     let lm = std::sync::LazyLock::new({
         let ex = &ex;
         move || build_linkmap(&link_pairs, ex)
@@ -2172,6 +2221,23 @@ fn bench(data: &Path, mode: &str) {
 #[cfg(test)]
 mod event_dedup_tests {
     use super::*;
+
+    #[test]
+    fn linked_and_later_ids_round_trip_after_shard_growth() {
+        let mut ex = Exotic::new();
+        let mut expected = Vec::new();
+        for i in 0..12000 {
+            if i == 6000 { ex.freeze_links(); }
+            let id = format!("opaque user {i}");
+            expected.push((ex.key(id.as_bytes()), id));
+        }
+        for (key, id) in expected {
+            assert_eq!(ex.key(id.as_bytes()), key);
+            let mut bytes = Vec::new();
+            ex.bytes(key, &mut bytes);
+            assert_eq!(bytes, id.as_bytes());
+        }
+    }
 
     #[test]
     fn event_keys_are_distinct_across_packed_and_fallback_encodings() {
