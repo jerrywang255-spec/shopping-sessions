@@ -7,13 +7,24 @@ use std::hash::{BuildHasher, RandomState};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AO};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AO};
 use std::sync::{Mutex, OnceLock};
 
 const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: u32 = 1_800_000;
 const EXOTIC: u64 = 1 << 63;
+
+static PROF_EVENT_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_CLICK_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_CLICK_IDENT_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prof_tsc() -> u64 {
+    unsafe { std::arch::x86_64::_rdtsc() }
+}
 
 // ------------------------------------------------------------------ files
 extern "C" {
@@ -1868,7 +1879,8 @@ fn parse_links(ex: &Exotic, m: &[u8], b: usize, e: usize, out: &mut Vec<(u64, u6
 }
 
 // ------------------------------------------------------------------ stage 2: dedup
-fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &'a [u8], b: usize, e: usize, out: &mut Parts<CRec<'a>>) {
+#[inline(always)]
+fn parse_clicks_direct_impl<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &'a [u8], b: usize, e: usize, out: &mut Parts<CRec<'a>>, prof: bool, ident: &mut u64) {
     let base = ctx.base;
     let hi = ctx.we;
     let lim = m.as_ptr() as usize + m.len();
@@ -1876,8 +1888,14 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
     const AHEAD: usize = 16;
     let mut ring = [CRec { person: 0, cid: &[], ts: 0, camp: 0 }; AHEAD];
     let mut queued = 0usize;
-    let resolve = |r: CRec<'a>, out: &mut Parts<CRec<'a>>| {
+    let mut resolve_cycles = 0u64;
+    let mut key_cycles = 0u64;
+    let mut resolve = |r: CRec<'a>, out: &mut Parts<CRec<'a>>| {
+        let started = if prof { prof_tsc() } else { 0 };
         let person = lm.get(r.person);
+        if prof {
+            resolve_cycles += prof_tsc() - started;
+        }
         out.push(part2(person), CRec { person, ..r });
     };
     scan_lines::<4>(m, b, e, &mut |f: &[&[u8]; 4]| {
@@ -1895,7 +1913,11 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
         };
         // Click IDs only break timestamp ties. Keep the original unquoted field.
         let cid = f[0];
+        let started = if prof { prof_tsc() } else { 0 };
         let user = ex.key_pre(f[1], upre, lim);
+        if prof {
+            key_cycles += prof_tsc() - started;
+        }
         lm.prefetch(user);
         let slot = queued % AHEAD;
         if queued >= AHEAD {
@@ -1907,6 +1929,16 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
     for k in queued.saturating_sub(AHEAD)..queued {
         resolve(ring[k % AHEAD], out);
     }
+    *ident += resolve_cycles + key_cycles;
+}
+
+fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &'a [u8], b: usize, e: usize, out: &mut Parts<CRec<'a>>) {
+    let mut ident = 0;
+    parse_clicks_direct_impl(ctx, ex, lm, dc, m, b, e, out, false, &mut ident);
+}
+
+fn parse_clicks_direct_profile<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &'a [u8], b: usize, e: usize, out: &mut Parts<CRec<'a>>, ident: &mut u64) {
+    parse_clicks_direct_impl(ctx, ex, lm, dc, m, b, e, out, true, ident);
 }
 
 #[derive(Default)]
@@ -2453,6 +2485,14 @@ fn main() {
     let nthreads = std::env::var("NCPU").ok().and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(1);
     let timing = std::env::var("SS_TIMING").is_ok();
+    let tsc_per_ns = if timing {
+        let started = std::time::Instant::now();
+        let cycles = prof_tsc();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        (prof_tsc() - cycles) as f64 / started.elapsed().as_nanos() as f64
+    } else {
+        1.0
+    };
     let t0 = std::time::Instant::now();
     let tick = |label: &str| {
         if timing { eprintln!("{:8.1} ms  {}", t0.elapsed().as_secs_f64()*1000.0, label); }
@@ -2508,10 +2548,7 @@ fn main() {
         })).collect();
         hs.into_iter().map(|h|h.join().unwrap()).collect()
     });
-    let lm = std::sync::LazyLock::new({
-        let ex = &ex;
-        move || build_linkmap(&link_pairs, ex)
-    });
+    let lm = OnceLock::new();
     tick("link rows parsed");
     let ev_next = AtomicUsize::new(0);
     let cl_next = AtomicUsize::new(0);
@@ -2520,10 +2557,12 @@ fn main() {
     let ev_cap = est_ev * 5 / 4 / nthreads / P1 + 32;
     let cl_cap = est_cl * 5 / 4 / nthreads / P2 + 32;
     let pr_cap = est_ev * 5 / 4 / nthreads / P2 + 32;
+    let parse_begin = std::time::Instant::now();
     let parse = || {
         let mut evp = EventBatch::alloc(ev_cap, P1);
         let mut clp = Parts::<CRec>::alloc(cl_cap, P2);
         let mut dc = DateCache::new();
+        let event_started = std::time::Instant::now();
         loop {
             let k = ev_next.fetch_add(1, AO::Relaxed);
             if k >= ev_chunks.len() { break; }
@@ -2531,26 +2570,59 @@ fn main() {
             parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
         }
         evp.wc.finish(&mut evp.records);
-        let ids = std::sync::LazyLock::force(&lm);
+        let event_ns = event_started.elapsed().as_nanos() as u64;
+        let wait_started = std::time::Instant::now();
+        let ids = lm.wait();
+        let wait_ns = wait_started.elapsed().as_nanos() as u64;
+        let click_started = std::time::Instant::now();
+        let mut click_ident = 0u64;
         loop {
             let k = cl_next.fetch_add(1, AO::Relaxed);
             if k >= cl_chunks.len() { break; }
             let (fi,b,e) = cl_chunks[k];
-            parse_clicks_direct(&ctx,&ex,ids,&mut dc,cl_maps[fi],b,e,&mut clp);
+            if timing {
+                parse_clicks_direct_profile(&ctx,&ex,ids,&mut dc,cl_maps[fi],b,e,&mut clp,&mut click_ident);
+            } else {
+                parse_clicks_direct(&ctx,&ex,ids,&mut dc,cl_maps[fi],b,e,&mut clp);
+            }
         }
-        (evp,clp)
+        if timing {
+            PROF_EVENT_NS.fetch_add(event_ns, AO::Relaxed);
+            PROF_WAIT_NS.fetch_add(wait_ns, AO::Relaxed);
+            PROF_CLICK_NS.fetch_add(click_started.elapsed().as_nanos() as u64, AO::Relaxed);
+            PROF_CLICK_IDENT_CYCLES.fetch_add(click_ident, AO::Relaxed);
+        }
+        (evp, clp, if timing { parse_begin.elapsed().as_nanos() as u64 } else { 0 })
     };
-    let parsed: Vec<(EventBatch<'_>, Parts<CRec>)> = std::thread::scope(|scope| {
+    let mut link_build_ns = 0u64;
+    let parsed: Vec<(EventBatch<'_>, Parts<CRec>, u64)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (1..nthreads).map(|_| scope.spawn(&parse)).collect();
         // Other workers can parse events while the calling thread resolves identities.
         let tl = std::time::Instant::now();
-        std::sync::LazyLock::force(&lm);
+        let built = build_linkmap(&link_pairs, &ex);
+        let _ = lm.set(built);
+        link_build_ns = tl.elapsed().as_nanos() as u64;
         if timing { eprintln!("  linkmap build {:?} (done at {:?})", tl.elapsed(), t0.elapsed()); }
         std::iter::once(parse()).chain(workers.into_iter().map(|h| h.join().unwrap())).collect()
     });
-    let lm = std::sync::LazyLock::force(&lm);
-    let (ev_parts,pc_parts):(Vec<_>,Vec<_>)=parsed.into_iter().unzip();
+    let lm = lm.get().unwrap();
+    let finished = parsed.iter().map(|row| row.2).max().unwrap_or(0);
+    let tail_ns: u128 = parsed.iter().map(|row| (finished - row.2) as u128).sum();
+    let (ev_parts, pc_parts): (Vec<_>, Vec<_>) = parsed.into_iter().map(|(ev, cl, _)| (ev, cl)).unzip();
     tick("parse, identity-aware clicks");
+    if timing {
+        let event_ms = PROF_EVENT_NS.load(AO::Relaxed) as f64 / 1e6;
+        let wait_ms = PROF_WAIT_NS.load(AO::Relaxed) as f64 / 1e6;
+        let click_ms = PROF_CLICK_NS.load(AO::Relaxed) as f64 / 1e6;
+        let ident_ms = PROF_CLICK_IDENT_CYCLES.load(AO::Relaxed) as f64 / tsc_per_ns / 1e6;
+        let idle_ms = tail_ns as f64 / 1e6;
+        eprintln!("  event parse worker-ms {event_ms:.1}");
+        eprintln!("  linkmap construction wall-ms {:.1}", link_build_ns as f64 / 1e6);
+        eprintln!("  linkmap wait worker-ms {wait_ms:.1}");
+        eprintln!("  click scan/parse worker-ms {:.1}", click_ms - ident_ms);
+        eprintln!("  click identity worker-ms {ident_ms:.1}");
+        eprintln!("  finish-barrier worker-ms {idle_ms:.1}");
+    }
     let p_next = AtomicUsize::new(0);
     let pe_parts: Vec<Parts<PRec>> = std::thread::scope(|s| {
         let hs:Vec<_> = (0..nthreads).map(|_|s.spawn(|| {
@@ -2802,7 +2874,7 @@ mod event_dedup_tests {
         let inputs = [a, b];
         let mut scratch = DedupScratch::default();
         let mut out = Parts::alloc(1, P2);
-        dedup_direct(&LinkMap::empty(), &inputs, 0, &mut scratch, &mut out);
+        dedup_direct(&LinkMap::empty(), &inputs, 0, &mut scratch, &mut out, &mut Wc::new(P2));
         let mut users = Vec::new();
         for p in 0..P2 {
             out.each(p, |r| users.push(r.person));
