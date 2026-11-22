@@ -106,9 +106,36 @@ fn for_lines<'a>(m: &'a [u8], b: usize, e: usize, mut f: impl FnMut(&'a [u8])) {
     }
 }
 
+/// Index of the first byte equal to `c`, same result as `s.iter().position(|&x| x == c)`.
+/// Word-at-a-time (SWAR) so the scalar scanner paths (lines wider than the 128-byte SIMD
+/// window, and each chunk's sub-128-byte tail) are not parsed one byte at a time; this matters
+/// for input whose line width varies past 128 bytes, where the SIMD fast path is bypassed.
 #[inline]
 fn memchr(c: u8, s: &[u8]) -> Option<usize> {
-    s.iter().position(|&x| x == c)
+    const LANES: usize = 8;
+    let n = s.len();
+    let p = s.as_ptr();
+    let ones = 0x0101_0101_0101_0101u64;
+    let needle = ones.wrapping_mul(c as u64);
+    let mut i = 0usize;
+    while i + LANES <= n {
+        // One aligned-size unaligned read of 8 bytes, then the classic SWAR zero-byte test.
+        let w = unsafe { (p.add(i) as *const u64).read_unaligned() };
+        let x = w ^ needle;
+        let hit = x.wrapping_sub(ones) & !x & 0x8080_8080_8080_8080u64;
+        if hit != 0 {
+            // Little-endian: lowest set high-bit is the earliest matching byte.
+            return Some(i + (hit.trailing_zeros() as usize >> 3));
+        }
+        i += LANES;
+    }
+    while i < n {
+        if unsafe { *p.add(i) } == c {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Split a CSV line into exactly N fields, removing whole-field quotes. False if malformed.
