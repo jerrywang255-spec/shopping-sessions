@@ -537,6 +537,50 @@ struct InternShard {
     entries: Vec<InternedId>,
 }
 
+impl InternShard {
+    fn intern(&mut self, hash: u64, s: &[u8]) -> usize {
+        let head = self.heads.get(&hash).copied();
+        let mut current = head;
+        loop {
+            let Some(entry_index) = current else {
+                let index = self.entries.len();
+                self.entries.push(InternedId { bytes: s.into(), next: head });
+                self.heads.insert(hash, std::num::NonZeroUsize::new(index + 1).unwrap());
+                break index;
+            };
+            let index = entry_index.get() - 1;
+            let entry = &self.entries[index];
+            // The full byte string decides equality, even when hashes collide.
+            if entry.bytes.as_ref() == s {
+                break index;
+            }
+            current = entry.next;
+        };
+    }
+}
+
+#[cfg(test)]
+mod intern_tests {
+    use super::InternShard;
+
+    #[test]
+    fn shared_hash_preserves_distinct_opaque_ids() {
+        let mut shard = InternShard::default();
+        let ids = [
+            &b"e00112233445566778899aabbccddeeff"[..],
+            &b"e00112233445566778899aabbccddeefF"[..],
+            "id-λ".as_bytes(),
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            assert_eq!(shard.intern(42, id), index);
+        }
+        for (index, id) in ids.iter().enumerate().rev() {
+            assert_eq!(shard.intern(42, id), index);
+            assert_eq!(shard.entries[index].bytes.as_ref(), *id);
+        }
+    }
+}
+
 /// Intern opaque IDs using exact byte equality and independent shard locks.
 struct Exotic {
     hash: RandomState,
@@ -561,23 +605,7 @@ impl Exotic {
         let hash = self.hash.hash_one(s);
         let shard = hash as usize & (INTERN_SHARDS - 1);
         let mut shard_data = self.shards[shard].lock().unwrap();
-        let head = shard_data.heads.get(&hash).copied();
-        let mut current = head;
-        let index = loop {
-            let Some(entry_index) = current else {
-                let index = shard_data.entries.len();
-                shard_data.entries.push(InternedId { bytes: s.into(), next: head });
-                shard_data.heads.insert(hash, std::num::NonZeroUsize::new(index + 1).unwrap());
-                break index;
-            };
-            let index = entry_index.get() - 1;
-            let entry = &shard_data.entries[index];
-            // The full byte string decides equality, even when hashes collide.
-            if entry.bytes.as_ref() == s {
-                break index;
-            }
-            current = entry.next;
-        };
+        let index = shard_data.intern(hash, s);
         EXOTIC | ((index as u64) << INTERN_SHARD_BITS) | shard as u64
     }
     fn bytes(&self, k: u64, out: &mut Vec<u8>) {
