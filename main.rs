@@ -1247,7 +1247,7 @@ fn build_linkmap(pairs: &[Vec<(u64, u64)>], ex: &Exotic) -> LinkMap {
 }
 
 // ------------------------------------------------------------------ records
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct EvRec {
     eid: u64,
@@ -1259,14 +1259,66 @@ struct EvRec {
     opaque_index: u32,
 }
 
+const EVENT_BLOCK: usize = 4;
+
 struct EventBatch<'a> {
+    pending: Vec<[EvRec; EVENT_BLOCK]>,
+    used: Vec<u8>,
     records: Parts<EvRec>,
     opaque_ids: Vec<&'a [u8]>,
 }
 
 impl<'a> EventBatch<'a> {
     fn alloc(count_per_part: usize, partitions: usize) -> Self {
-        Self { records: Parts::alloc(count_per_part, partitions), opaque_ids: Vec::new() }
+        Self {
+            records: Parts::alloc(count_per_part.next_multiple_of(EVENT_BLOCK), partitions),
+            opaque_ids: Vec::new(),
+            pending: vec![[EvRec::default(); EVENT_BLOCK]; partitions],
+            used: vec![0; partitions],
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, p: usize, record: EvRec) {
+        let used = self.used[p] as usize;
+        self.pending[p][used] = record;
+        if used + 1 < EVENT_BLOCK {
+            self.used[p] += 1;
+            return;
+        }
+        self.used[p] = 0;
+        let n = self.records.len[p] as usize;
+        if n + EVENT_BLOCK <= self.records.cap {
+            // Both the partition stride and write offset are whole blocks.
+            let dest = unsafe { self.records.base.add(p * self.records.cap + n) };
+            let block = &self.pending[p];
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            unsafe {
+                use std::arch::x86_64::{_mm256_loadu_si256, _mm256_stream_si256};
+                const { assert!(std::mem::size_of::<EvRec>() == 32); }
+                for (i, row) in block.iter().enumerate() {
+                    let value = _mm256_loadu_si256((row as *const EvRec).cast());
+                    _mm256_stream_si256(dest.add(i).cast(), value);
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), dest, EVENT_BLOCK); }
+            self.records.len[p] += EVENT_BLOCK as u32;
+        } else {
+            self.records.spill[p].extend_from_slice(&self.pending[p]);
+        }
+    }
+
+    fn finish(&mut self) {
+        // Make all streamed blocks visible before the batch passes to dedup workers.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe { std::arch::x86_64::_mm_sfence(); }
+        for (p, used) in self.used.iter_mut().enumerate() {
+            for &record in &self.pending[p][..*used as usize] {
+                self.records.push(p, record);
+            }
+            *used = 0;
+        }
     }
 
     fn key(&mut self, ex: &Exotic, id: &'a [u8], limit: usize) -> (u64, u32) {
@@ -1413,7 +1465,7 @@ fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: 
         } else {
             EvRec { eid, user: 0, ts: 0, ingest, pc: 0, opaque_index }
         };
-        out.records.push(part1(eid), rec);
+        out.push(part1(eid), rec);
     });
 }
 
@@ -2024,6 +2076,7 @@ fn main() {
             let (fi,b,e) = ev_chunks[k];
             parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
         }
+        evp.finish();
         let ids = std::sync::LazyLock::force(&lm);
         loop {
             let k = cl_next.fetch_add(1, AO::Relaxed);
@@ -2164,7 +2217,8 @@ fn bench(data: &Path, mode: &str) {
         let t = std::time::Instant::now();
         let mut evp = EventBatch::alloc(total / 80 * 5 / 4 / P1 + 32, P1);
         eprintln!("alloc {:?}", t.elapsed());
-        for m in &ev_maps { parse_events(&ctx, &ex, &mut dc, m, 0, m.len(), &mut evp); if mode == "parse_np" { evp.records.clear(); evp.opaque_ids.clear(); } }
+        for m in &ev_maps { parse_events(&ctx, &ex, &mut dc, m, 0, m.len(), &mut evp); if mode == "parse_np" { evp.finish(); evp.records.clear(); evp.opaque_ids.clear(); } }
+        evp.finish();
         eprintln!("{} {:?} n={}", mode, t.elapsed(), (0..P1).map(|p| evp.records.count(p)).sum::<usize>());
         return;
     }
@@ -2293,6 +2347,22 @@ mod event_dedup_tests {
                 let mut id = *b"e12345678";
                 id[at] = byte;
                 check(&id);
+            }
+        }
+    }
+
+    #[test]
+    fn event_blocks_keep_order_through_spill_and_partial_tails() {
+        for total in 0..40 {
+            let mut batch = EventBatch::alloc(4, 3);
+            for i in 0..total {
+                batch.push(i % 3, EvRec { eid: i as u64, ..EvRec::default() });
+            }
+            batch.finish();
+            for p in 0..3 {
+                let mut got = Vec::new();
+                batch.records.each(p, |r| got.push(r.eid));
+                assert_eq!(got, (p..total).step_by(3).map(|i| i as u64).collect::<Vec<_>>());
             }
         }
     }
