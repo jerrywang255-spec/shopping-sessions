@@ -2491,6 +2491,29 @@ fn main() {
     let ev_chunks = make_chunks(&ev_maps, 4 << 20);
     let cl_chunks = make_chunks(&cl_maps, 4 << 20);
     let ln_chunks = make_chunks(&ln_maps, 1 << 20);
+    // Ask the kernel to read every input chunk ahead, in the order the workers consume them,
+    // so a cold page cache streams from disk at full speed instead of faulting 4 KB at a time.
+    if std::env::var_os("SS_NOWILL").is_none() {
+        let order: Vec<(usize, usize)> = ln_chunks.iter().map(|&(fi, b, e)| (ln_maps[fi].as_ptr() as usize + b, e - b))
+            .chain(ev_chunks.iter().map(|&(fi, b, e)| (ev_maps[fi].as_ptr() as usize + b, e - b)))
+            .chain(cl_chunks.iter().map(|&(fi, b, e)| (cl_maps[fi].as_ptr() as usize + b, e - b)))
+            .collect();
+        let nwill: usize = std::env::var("SS_WILLT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let order = std::sync::Arc::new(order);
+        for w in 0..nwill {
+            let order = order.clone();
+            std::thread::spawn(move || {
+                for (i, &(p, len)) in order.iter().enumerate() {
+                    if i % nwill != w {
+                        continue;
+                    }
+                    let start = p & !4095;
+                    let end = p + len;
+                    unsafe { madvise(start as *mut u8, end - start, 3) }; // MADV_WILLNEED
+                }
+            });
+        }
+    }
     let ev_bytes: usize = ev_maps.iter().map(|m|m.len()).sum();
     let cl_bytes: usize = cl_maps.iter().map(|m|m.len()).sum();
     tick("setup");
