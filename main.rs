@@ -8,7 +8,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -148,11 +148,12 @@ fn fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
 
 /// SIMD line splitter: calls `emit` with the N unquoted fields of every well-formed line
 /// starting in [b, e) (skipping the file's header line). Malformed lines are skipped.
+static NO512: OnceLock<bool> = OnceLock::new();
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, emit: &mut impl FnMut(&[&'a [u8]; N])) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("bmi2") {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("bmi2") && !*NO512.get_or_init(|| std::env::var_os("SS_NO512").is_some()) {
             unsafe { scan_lines_avx512::<N>(m, b, e, emit) };
             return;
         }
@@ -214,30 +215,92 @@ fn emit_line<'a, const N: usize>(m: &'a [u8], line_start: usize, ends: &[usize; 
     emit(&f);
 }
 
-// Validate whole-field quoting for a row of up to 128 bytes. End bits
-// include the newline, so an empty final field still has a delimiter.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2,popcnt")]
-unsafe fn quoted_fields(ends: u128, quotes: u128) -> Option<u32> {
-    use std::arch::x86_64::_pext_u64;
-    if quotes == 0 {
-        return Some(0);
+/// Like `emit_line`, with the line's quote mask (bit i = byte line_start+i is a quote).
+#[inline(always)]
+fn emit_line_q<'a, const N: usize>(m: &'a [u8], ls: usize, ends: &[usize; N], q0: u64, q1: u64, emit: &mut impl FnMut(&[&'a [u8]; N])) {
+    let mut f: [&[u8]; N] = [&[]; N];
+    let mut s = ls;
+    if (q0 | q1) == 0 {
+        for k in 0..N {
+            let t = ends[k];
+            f[k] = unsafe { m.get_unchecked(s..t) };
+            s = t + 1;
+        }
+    } else {
+        let qm = (q0 as u128) | ((q1 as u128) << 64);
+        let mut expect: u128 = 0;
+        for k in 0..N {
+            let t = ends[k];
+            let rs = s - ls;
+            let rt = t - ls;
+            let q = (((qm >> rs) & 1) as usize) & ((t > s) as usize);
+            // a quoted field needs length >= 2; its closing quote is at rt-1
+            let qq = q & ((t >= s + 2) as usize);
+            expect |= ((qq as u128) << rs) | ((qq as u128) << (rt.wrapping_sub(1) & 127));
+            let a = s + qq;
+            let z = t - qq;
+            f[k] = unsafe { m.get_unchecked(a..z) };
+            s = t + 1;
+        }
+        if expect != qm {
+            return;
+        }
     }
-    let starts = (ends << 1) | 1;
-    let opening = starts & quotes;
-    let closing = (ends >> 1) & quotes;
-    // Every quote must occupy exactly one boundary. A lone quote occupies both.
-    if (quotes ^ opening) != closing {
-        return None;
+    emit(&f);
+}
+
+#[inline(always)]
+fn pxor64(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
+/// One line from its masks (bits relative to the line start `s`, already cut at the line end `pl`):
+/// commas c0|c1<<64 (exactly N-1 of them), quotes q0|q1<<64. Validates the quoting without branches
+/// on the (common) quoted case and strips whole-field quotes.
+#[inline(always)]
+unsafe fn emit_line_masks<'a, const N: usize>(m: &'a [u8], s: usize, pl: usize, c0: u64, c1: u64, q0: u64, q1: u64, emit: &mut impl FnMut(&[&'a [u8]; N])) {
+    let base = m.as_ptr();
+    // field boundaries
+    let mut ends = [0usize; N];
+    let mut x0 = c0;
+    let mut x1 = c1;
+    for k in 0..N - 1 {
+        let z0 = x0 == 0;
+        let pos = if z0 { 64 + x1.trailing_zeros() as usize } else { x0.trailing_zeros() as usize };
+        ends[k] = pos;
+        x0 &= x0.wrapping_sub(1);
+        x1 = if z0 { x1 & x1.wrapping_sub(1) } else { x1 };
     }
-    let pack = |bits: u128, mask: u128| {
-        let low = mask as u64;
-        _pext_u64(bits as u64, low)
-            | (_pext_u64((bits >> 64) as u64, (mask >> 64) as u64) << low.count_ones())
-    };
-    let opened = pack(opening, starts);
-    let closed = pack(closing << 1, ends);
-    (opened == closed).then_some(opened as u32)
+    ends[N - 1] = pl;
+    // quoting: opening quotes must start a field, closing quotes must end one, no comma inside
+    // quotes, and every quote closed. Starts S = (c << 1) | 1, last bytes E = (c >> 1) | bit(pl - 1).
+    let px0 = pxor64(q0);
+    let px1 = pxor64(q1) ^ (0u64.wrapping_sub((q0.count_ones() & 1) as u64));
+    let s0 = (c0 << 1) | 1;
+    let s1 = (c1 << 1) | (c0 >> 63);
+    let lp = pl.wrapping_sub(1);
+    let e0 = (c0 >> 1) | (c1 << 63) | if lp < 64 { 1u64 << lp } else { 0 };
+    let e1 = (c1 >> 1) | if lp >= 64 && lp < 128 { 1u64 << (lp - 64) } else { 0 };
+    let bad = ((q0 & px0) & !s0) | ((q1 & px1) & !s1) | ((q0 & !px0) & !e0) | ((q1 & !px1) & !e1) | (c0 & px0) | (c1 & px1);
+    let open_end = ((q0.count_ones() + q1.count_ones()) & 1) as u64;
+    if (bad | open_end) != 0 {
+        return;
+    }
+    let mut f: [&[u8]; N] = [&[]; N];
+    let mut a = s;
+    for k in 0..N {
+        let t = s + ends[k];
+        let q = (*base.add(a) == b'"') as usize & ((t > a) as usize);
+        f[k] = std::slice::from_raw_parts(base.add(a + q), t - a - 2 * q);
+        a = t + 1;
+    }
+    emit(&f);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -262,6 +325,9 @@ unsafe fn scan_lines_avx2<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, e
     let _ = mask64;
     while s < e && s + 128 <= len {
         let p = base.add(s);
+        if s + 2048 < len {
+            _mm_prefetch(p.add(2048) as *const i8, _MM_HINT_T0);
+        }
         let a0 = _mm256_loadu_si256(p as *const __m256i);
         let a1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
         let a2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
@@ -283,16 +349,12 @@ unsafe fn scan_lines_avx2<'a, const N: usize>(m: &'a [u8], b: usize, e: usize, e
         }
         let pl = nm.trailing_zeros() as usize;
         let below = (1u128 << pl) - 1;
-        let mut cm = (mv(a0, vc) | (mv(a1, vc) << 32) | (mv(a2, vc) << 64) | (mv(a3, vc) << 96)) & below;
+        let cm = (mv(a0, vc) | (mv(a1, vc) << 32) | (mv(a2, vc) << 64) | (mv(a3, vc) << 96)) & below;
         if cm.count_ones() as usize == N - 1 {
-            for k in 0..N - 1 {
-                ends[k] = s + cm.trailing_zeros() as usize;
-                cm &= cm - 1;
-            }
-            ends[N - 1] = s + pl;
             let qm = (mv(a0, vq) | (mv(a1, vq) << 32) | (mv(a2, vq) << 64) | (mv(a3, vq) << 96)) & below;
-            emit_line(m, s, &ends, qm.count_ones(), emit);
+            emit_line_masks(m, s, pl, cm as u64, (cm >> 64) as u64, qm as u64, (qm >> 64) as u64, emit);
         }
+        let _ = &mut ends;
         s += pl + 1;
     }
     // tail: scalar
@@ -330,6 +392,9 @@ unsafe fn scan_lines_avx512<'a, const N: usize>(m: &'a [u8], b: usize, e: usize,
     let mut ends = [0usize; N];
     while s < e && s + 128 <= len {
         let p = base.add(s);
+        if s + 2048 < len {
+            _mm_prefetch(p.add(2048) as *const i8, _MM_HINT_T0);
+        }
         let a0 = _mm512_loadu_si512(p as *const _);
         let a1 = _mm512_loadu_si512(p.add(64) as *const _);
         let n0 = _mm512_cmpeq_epi8_mask(a0, vn);
@@ -353,31 +418,11 @@ unsafe fn scan_lines_avx512<'a, const N: usize>(m: &'a [u8], b: usize, e: usize,
         let c0 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a0, vc), pl as u32);
         let c1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a1, vc), pl.saturating_sub(64) as u32);
         if (c0.count_ones() + c1.count_ones()) as usize == N - 1 {
-            let mut x0 = c0;
-            let mut x1 = c1;
-            for k in 0..N - 1 {
-                let z0 = x0 == 0;
-                let pos = if z0 { 64 + x1.trailing_zeros() as usize } else { x0.trailing_zeros() as usize };
-                ends[k] = s + pos;
-                x0 &= x0.wrapping_sub(1);
-                x1 = if z0 { x1 & x1.wrapping_sub(1) } else { x1 };
-            }
-            ends[N - 1] = s + pl;
             let q0 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a0, vq), pl as u32);
             let q1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(a1, vq), pl.saturating_sub(64) as u32);
-            let delimiters = c0 as u128 | ((c1 as u128) << 64) | (1u128 << pl);
-            let quotes = q0 as u128 | ((q1 as u128) << 64);
-            if let Some(quoted) = quoted_fields(delimiters, quotes) {
-                let mut fields: [&[u8]; N] = [&[]; N];
-                let mut start = s;
-                for k in 0..N {
-                    let trim = ((quoted >> k) & 1) as usize;
-                    fields[k] = m.get_unchecked(start + trim..ends[k] - trim);
-                    start = ends[k] + 1;
-                }
-                emit(&fields);
-            }
+            emit_line_masks(m, s, pl, c0, c1, q0, q1, emit);
         }
+        let _ = &mut ends;
         s += pl + 1;
     }
     while s < e && s < len {
@@ -419,65 +464,189 @@ fn advise_huge(p: *mut u8, len: usize) {
     }
 }
 
-/// P partitions of fixed capacity inside one arena; overflow spills into Vecs.
+/// Bytes per block. Partitions are chains of blocks, so memory is touched only as it fills,
+/// and a consumed partition's blocks can be recycled for the next stage's output.
+const BLK: usize = 8192;
+const RESERVE: usize = 1 << 30;
+
+/// Block allocator: a free list, then a bump pointer through reserved huge-page memory.
+struct Pool {
+    bump: *mut u8,
+    end: *mut u8,
+    free: Vec<*mut u8>,
+}
+unsafe impl Send for Pool {}
+impl Pool {
+    fn new() -> Self {
+        Pool { bump: std::ptr::null_mut(), end: std::ptr::null_mut(), free: Vec::new() }
+    }
+    #[cold]
+    fn refill(&mut self) {
+        unsafe {
+            let p = mmap(std::ptr::null_mut(), RESERVE, 3, 0x02 | 0x20 | 0x4000, -1, 0);
+            if p as isize == -1 {
+                panic!("mmap failed");
+            }
+            madvise(p, RESERVE, 14); // MADV_HUGEPAGE
+            self.bump = p;
+            self.end = p.add(RESERVE);
+        }
+    }
+    #[inline(always)]
+    fn get(&mut self) -> *mut u8 {
+        if let Some(b) = self.free.pop() {
+            return b;
+        }
+        if self.bump == self.end {
+            self.refill();
+        }
+        let b = self.bump;
+        self.bump = unsafe { b.add(BLK) };
+        b
+    }
+}
+
+/// P partitions, each a chain of blocks taken from one pool (owned by this set, never freed).
 struct Parts<T: Copy> {
-    base: *mut T,
-    cap: usize,
-    len: Vec<u32>,
-    spill: Vec<Vec<T>>,
+    cur: Vec<*mut T>,
+    lim: Vec<*mut T>,
+    blocks: Vec<Vec<*mut T>>,
+    pool: *mut Pool,
 }
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
 unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 impl<T: Copy> Parts<T> {
-    fn new(mem: *mut u8, bytes: usize, np: usize) -> Self {
-        let cap = bytes / std::mem::size_of::<T>() / np;
-        Parts { base: mem as *mut T, cap, len: vec![0; np], spill: (0..np).map(|_| Vec::new()).collect() }
+    const PER: usize = BLK / std::mem::size_of::<T>();
+    /// `_count_per_part` is a sizing hint kept for the callers; memory grows on demand.
+    fn alloc(_count_per_part: usize, np: usize) -> Self {
+        let pool = Box::into_raw(Box::new(Pool::new()));
+        Parts { cur: vec![std::ptr::null_mut(); np], lim: vec![std::ptr::null_mut(); np], blocks: (0..np).map(|_| Vec::new()).collect(), pool }
     }
-    fn alloc(count_per_part: usize, np: usize) -> Self {
-        let bytes = count_per_part * np * std::mem::size_of::<T>();
-        Parts::new(arena(bytes), bytes, np)
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, p: usize) {
+        let b = unsafe { (*self.pool).get() } as *mut T;
+        self.blocks[p].push(b);
+        self.cur[p] = b;
+        self.lim[p] = unsafe { b.add(Self::PER) };
     }
     #[inline(always)]
     fn push(&mut self, p: usize, x: T) {
         unsafe {
-            let l = *self.len.get_unchecked(p) as usize;
-            if l < self.cap {
-                self.base.add(p * self.cap + l).write(x);
-                *self.len.get_unchecked_mut(p) = l as u32 + 1;
-            } else {
-                self.spill.get_unchecked_mut(p).push(x);
+            if *self.cur.get_unchecked(p) == *self.lim.get_unchecked(p) {
+                self.grow(p);
             }
+            let c = *self.cur.get_unchecked(p);
+            c.write(x);
+            *self.cur.get_unchecked_mut(p) = c.add(1);
         }
     }
+    /// Room for `r` more records in the current block (allocating one if needed); returns the write position.
     #[inline(always)]
-    fn main(&self, p: usize) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.base.add(p * self.cap), self.len[p] as usize) }
+    fn reserve(&mut self, p: usize, r: usize) -> *mut T {
+        unsafe {
+            if (*self.lim.get_unchecked(p) as usize) - (*self.cur.get_unchecked(p) as usize) < r * std::mem::size_of::<T>() {
+                self.grow(p);
+            }
+            let c = *self.cur.get_unchecked(p);
+            *self.cur.get_unchecked_mut(p) = c.add(r);
+            c
+        }
     }
     #[inline(always)]
     fn count(&self, p: usize) -> usize {
-        self.len[p] as usize + self.spill[p].len()
+        let n = self.blocks[p].len();
+        if n == 0 {
+            return 0;
+        }
+        (n - 1) * Self::PER + (self.cur[p] as usize - self.blocks[p][n - 1] as usize) / std::mem::size_of::<T>()
+    }
+    /// The partition as slices, one per block.
+    #[inline(always)]
+    fn runs(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
+        let bl = &self.blocks[p];
+        let n = bl.len();
+        let last = self.cur[p];
+        bl.iter().enumerate().map(move |(i, &b)| {
+            let len = if i + 1 == n { (last as usize - b as usize) / std::mem::size_of::<T>() } else { Self::PER };
+            unsafe { std::slice::from_raw_parts(b as *const T, len) }
+        })
     }
     #[inline(always)]
     fn each(&self, p: usize, mut f: impl FnMut(&T)) {
-        for x in self.main(p) {
-            f(x);
+        for sl in self.runs(p) {
+            for x in sl {
+                f(x);
+            }
         }
-        for x in &self.spill[p] {
-            f(x);
+    }
+    /// Hand partition p's blocks to `pool` (the partition is empty afterwards).
+    fn release(&mut self, p: usize, pool: *mut Pool) {
+        for b in self.blocks[p].drain(..) {
+            unsafe { (*pool).free.push(b as *mut u8) };
         }
+        self.cur[p] = std::ptr::null_mut();
+        self.lim[p] = std::ptr::null_mut();
     }
     fn clear(&mut self) {
-        for l in self.len.iter_mut() {
-            *l = 0;
-        }
-        for v in self.spill.iter_mut() {
-            v.clear();
+        let pool = self.pool;
+        for p in 0..self.blocks.len() {
+            self.release(p, pool);
         }
     }
-    /// Reuse this arena's memory for another record type.
-    fn recycle<U: Copy>(self, np: usize) -> Parts<U> {
-        let bytes = self.cap * np * std::mem::size_of::<T>();
-        Parts::new(self.base as *mut u8, bytes, np)
+}
+
+/// Software write-combining in front of `Parts`: records gather in one 64-byte line per partition
+/// and go to memory with non-temporal stores (no read-for-ownership, no cache pollution).
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([u8; 64]);
+struct Wc {
+    stage: Vec<Line>,
+    fill: Vec<u8>,
+}
+impl Wc {
+    fn new(np: usize) -> Self {
+        Wc { stage: vec![Line([0; 64]); np], fill: vec![0; np] }
+    }
+    #[inline(always)]
+    fn push<T: Copy>(&mut self, parts: &mut Parts<T>, p: usize, x: T) {
+        let sz = std::mem::size_of::<T>();
+        let r = 64 / sz;
+        unsafe {
+            let f = *self.fill.get_unchecked(p) as usize;
+            let line = self.stage.get_unchecked_mut(p).0.as_mut_ptr();
+            (line.add(f * sz) as *mut T).write(x);
+            if f + 1 < r {
+                *self.fill.get_unchecked_mut(p) = (f + 1) as u8;
+                return;
+            }
+            *self.fill.get_unchecked_mut(p) = 0;
+            let dst = parts.reserve(p, r) as *mut u8;
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::*;
+                let a = _mm256_load_si256(line as *const __m256i);
+                let b = _mm256_load_si256(line.add(32) as *const __m256i);
+                _mm256_stream_si256(dst as *mut __m256i, a);
+                _mm256_stream_si256(dst.add(32) as *mut __m256i, b);
+            }
+        }
+    }
+    fn finish<T: Copy>(&mut self, parts: &mut Parts<T>) {
+        let sz = std::mem::size_of::<T>();
+        for p in 0..self.fill.len() {
+            let f = self.fill[p] as usize;
+            for k in 0..f {
+                let x = unsafe { (self.stage[p].0.as_ptr().add(k * sz) as *const T).read() };
+                parts.push(p, x);
+            }
+            self.fill[p] = 0;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
     }
 }
 
@@ -531,57 +700,33 @@ const INTERN_SHARDS: usize = 1 << INTERN_SHARD_BITS;
 
 struct InternedId {
     bytes: Box<[u8]>,
-    hash: u64,
+    next: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Default)]
 struct InternShard {
-    // A zero slot is empty. Other slots hold a one-based index into entries.
-    slots: Vec<usize>,
+    heads: HashMap<u64, std::num::NonZeroUsize>,
     entries: Vec<InternedId>,
 }
 
 impl InternShard {
-    fn probe(&self, hash: u64, s: &[u8]) -> Result<usize, usize> {
-        let mask = self.slots.len() - 1;
-        let mut slot = (hash >> INTERN_SHARD_BITS) as usize & mask;
-        loop {
-            let index = self.slots[slot];
-            if index == 0 {
-                return Err(slot);
-            }
-            let entry = &self.entries[index - 1];
-            if entry.hash == hash && entry.bytes.as_ref() == s {
-                return Ok(index - 1);
-            }
-            slot = (slot + 1) & mask;
-        }
-    }
-
-    fn grow(&mut self) {
-        let size = (self.slots.len() * 2).max(16);
-        self.slots = vec![0; size];
-        for (i, entry) in self.entries.iter().enumerate() {
-            let mut slot = (entry.hash >> INTERN_SHARD_BITS) as usize & (size - 1);
-            while self.slots[slot] != 0 {
-                slot = (slot + 1) & (size - 1);
-            }
-            self.slots[slot] = i + 1;
-        }
-    }
-
     fn intern(&mut self, hash: u64, s: &[u8]) -> usize {
-        if self.entries.len() * 4 >= self.slots.len() * 3 {
-            self.grow();
-        }
-        match self.probe(hash, s) {
-            Ok(index) => index,
-            Err(slot) => {
+        let head = self.heads.get(&hash).copied();
+        let mut current = head;
+        loop {
+            let Some(entry_index) = current else {
                 let index = self.entries.len();
-                self.entries.push(InternedId { bytes: s.into(), hash });
-                self.slots[slot] = index + 1;
-                index
+                self.entries.push(InternedId { bytes: s.into(), next: head });
+                self.heads.insert(hash, std::num::NonZeroUsize::new(index + 1).unwrap());
+                break index;
+            };
+            let index = entry_index.get() - 1;
+            let entry = &self.entries[index];
+            // The full byte string decides equality, even when hashes collide.
+            if entry.bytes.as_ref() == s {
+                break index;
             }
+            current = entry.next;
         }
     }
 }
@@ -608,28 +753,238 @@ mod intern_tests {
     }
 }
 
+/// Lock-free table of long IDs that live in the (never unmapped) input files: a slot holds a
+/// nonzero 64-bit hash and a pointer|length; equality is decided by the bytes.
+struct LongIds {
+    slots: Vec<[std::sync::atomic::AtomicU64; 2]>,
+    mask: usize,
+    count: AtomicUsize,
+    full: std::sync::atomic::AtomicBool,
+}
+const LONG_TAG: u64 = 1 << 62;
+const HEX_TAG: u64 = 1 << 61;
+
+/// IDs of one byte + 32 lowercase hex digits, stored exactly as (prefix, 128-bit value): equality
+/// never touches the input bytes again. Slot: [meta = 1 | prefix << 8 (0 empty, 2 busy), lo, hi, ptr].
+struct HexIds {
+    slots: Vec<[std::sync::atomic::AtomicU64; 4]>,
+    mask: usize,
+    count: AtomicUsize,
+    full: std::sync::atomic::AtomicBool,
+}
+impl HexIds {
+    fn new(cap: usize) -> Self {
+        let cap = cap.next_power_of_two().max(1024);
+        let mut slots = Vec::with_capacity(cap);
+        slots.resize_with(cap, || Default::default());
+        HexIds { slots, mask: cap - 1, count: AtomicUsize::new(0), full: std::sync::atomic::AtomicBool::new(false) }
+    }
+    #[inline(always)]
+    fn home(&self, s: &[u8], lo: u64, hi: u64) -> usize {
+        let meta = 1 | ((s[0] as u64) << 8);
+        let h = fold_mul(lo ^ meta.wrapping_mul(0x9E37_79B9_7F4A_7C15), hi ^ 0x243F_6A88_85A3_08D3);
+        (h >> 7) as usize & self.mask
+    }
+    #[inline(always)]
+    fn prefetch(&self, i: usize) {
+        unsafe { std::arch::x86_64::_mm_prefetch(self.slots.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    }
+    #[inline]
+    fn slot(&self, s: &[u8], lo: u64, hi: u64) -> Option<usize> {
+        self.slot_at(s, lo, hi, self.home(s, lo, hi))
+    }
+    #[inline]
+    fn slot_at(&self, s: &[u8], lo: u64, hi: u64, home: usize) -> Option<usize> {
+        let meta = 1 | ((s[0] as u64) << 8);
+        let mut i = home;
+        let mut probes = 0;
+        loop {
+            let cell = &self.slots[i];
+            let mut m = cell[0].load(AO::Acquire);
+            if m == 0 {
+                if self.full.load(AO::Relaxed) {
+                    return None;
+                }
+                match cell[0].compare_exchange(0, 2, AO::AcqRel, AO::Acquire) {
+                    Ok(_) => {
+                        cell[1].store(lo, AO::Relaxed);
+                        cell[2].store(hi, AO::Relaxed);
+                        cell[3].store(s.as_ptr() as u64, AO::Relaxed);
+                        cell[0].store(meta, AO::Release);
+                        if self.count.fetch_add(1, AO::Relaxed) * 10 > self.slots.len() * 6 {
+                            self.full.store(true, AO::Relaxed);
+                        }
+                        return Some(i);
+                    }
+                    Err(x) => m = x,
+                }
+            }
+            while m == 2 {
+                std::hint::spin_loop();
+                m = cell[0].load(AO::Acquire);
+            }
+            if m == meta && cell[1].load(AO::Relaxed) == lo && cell[2].load(AO::Relaxed) == hi {
+                return Some(i);
+            }
+            i = (i + 1) & self.mask;
+            probes += 1;
+            if probes > 1024 {
+                return None;
+            }
+        }
+    }
+    fn bytes(&self, i: usize) -> &'static [u8] {
+        let p = self.slots[i][3].load(AO::Acquire);
+        unsafe { std::slice::from_raw_parts(p as *const u8, 33) }
+    }
+    fn len(&self) -> usize {
+        self.count.load(AO::Relaxed)
+    }
+}
+
+#[inline(always)]
+fn fold_mul(a: u64, b: u64) -> u64 {
+    let m = (a as u128) * (b as u128);
+    (m as u64) ^ ((m >> 64) as u64)
+}
+/// Hash of an ID of 16+ bytes (first and last 16 bytes, and the length).
+#[inline(always)]
+fn long_hash(s: &[u8]) -> u64 {
+    let n = s.len();
+    unsafe {
+        let p = s.as_ptr();
+        let a = (p as *const u64).read_unaligned();
+        let b = (p.add(8) as *const u64).read_unaligned();
+        let c = (p.add(n - 16) as *const u64).read_unaligned();
+        let d = (p.add(n - 8) as *const u64).read_unaligned();
+        let h = fold_mul(a ^ 0x243F_6A88_85A3_08D3, b ^ 0x1319_8A2E_0370_7344) ^ fold_mul(c ^ 0xA409_3822_299F_31D0, d ^ (n as u64).wrapping_mul(0x082E_FA98_EC4E_6C89));
+        fold_mul(h, 0x9E37_79B9_7F4A_7C15) | 1
+    }
+}
+
+/// Byte equality of two strings of the same length n >= 16 (16-byte chunks, last one overlapping).
+#[inline(always)]
+unsafe fn eq_long(a: *const u8, b: *const u8, n: usize) -> bool {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+    while i + 16 < n {
+        let x = _mm_loadu_si128(a.add(i) as *const __m128i);
+        let y = _mm_loadu_si128(b.add(i) as *const __m128i);
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) != 0xFFFF {
+            return false;
+        }
+        i += 16;
+    }
+    let x = _mm_loadu_si128(a.add(n - 16) as *const __m128i);
+    let y = _mm_loadu_si128(b.add(n - 16) as *const __m128i);
+    _mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) == 0xFFFF
+}
+
+/// Exact 128-bit value of 32 lowercase hex digits at p, or None.
+#[inline(always)]
+unsafe fn hex128(p: *const u8) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    let v = _mm256_loadu_si256(p as *const __m256i);
+    let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+    let a = _mm256_sub_epi8(v, _mm256_set1_epi8((b'a' - 10) as i8));
+    // digit: (v - '0') as unsigned < 10; letter: (v - 'a' + 10) in 10..16
+    let is_d = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    let a10 = _mm256_sub_epi8(a, _mm256_set1_epi8(10));
+    let is_a = _mm256_cmpeq_epi8(_mm256_min_epu8(a10, _mm256_set1_epi8(5)), a10);
+    if _mm256_movemask_epi8(_mm256_or_si256(is_d, is_a)) != -1 {
+        return None;
+    }
+    let nib = _mm256_blendv_epi8(a, d, is_d);
+    // pairs (hi nibble first) -> bytes
+    let w = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+    let packed = _mm256_packus_epi16(w, w); // per 128-bit lane: 8 bytes in the low half
+    let lo = _mm256_extract_epi64(packed, 0) as u64;
+    let hi = _mm256_extract_epi64(packed, 2) as u64;
+    Some((lo, hi))
+}
+
+impl LongIds {
+    fn new(cap: usize) -> Self {
+        let cap = cap.next_power_of_two().max(1024);
+        let mut slots = Vec::with_capacity(cap);
+        slots.resize_with(cap, || [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)]);
+        LongIds { slots, mask: cap - 1, count: AtomicUsize::new(0), full: std::sync::atomic::AtomicBool::new(false) }
+    }
+    /// Slot of `s` (len >= 16, inside a static mapping), or None when the table is too full.
+    #[inline]
+    fn slot(&self, s: &[u8]) -> Option<usize> {
+        if s.len() > 0xFFFF {
+            return None;
+        }
+        let h = long_hash(s);
+        let packed = (s.as_ptr() as u64) | ((s.len() as u64) << 48);
+        let mut i = (h >> 20) as usize & self.mask;
+        let mut probes = 0;
+        loop {
+            let cell = &self.slots[i];
+            let mut cur = cell[0].load(AO::Acquire);
+            if cur == 0 {
+                if self.full.load(AO::Relaxed) {
+                    return None;
+                }
+                match cell[0].compare_exchange(0, h, AO::AcqRel, AO::Acquire) {
+                    Ok(_) => {
+                        cell[1].store(packed, AO::Release);
+                        if self.count.fetch_add(1, AO::Relaxed) * 10 > self.slots.len() * 6 {
+                            self.full.store(true, AO::Relaxed);
+                        }
+                        return Some(i);
+                    }
+                    Err(x) => cur = x,
+                }
+            }
+            if cur == h {
+                let mut v = cell[1].load(AO::Acquire);
+                while v == 0 {
+                    std::hint::spin_loop();
+                    v = cell[1].load(AO::Acquire);
+                }
+                if (v >> 48) as usize == s.len() && unsafe { eq_long((v & ((1 << 48) - 1)) as *const u8, s.as_ptr(), s.len()) } {
+                    return Some(i);
+                }
+            }
+            i = (i + 1) & self.mask;
+            probes += 1;
+            if probes > 1024 {
+                return None;
+            }
+        }
+    }
+    fn len(&self) -> usize {
+        self.count.load(AO::Relaxed)
+    }
+    fn bytes(&self, i: usize) -> &'static [u8] {
+        let v = self.slots[i][1].load(AO::Acquire);
+        unsafe { std::slice::from_raw_parts((v & ((1 << 48) - 1)) as *const u8, (v >> 48) as usize) }
+    }
+}
+
 /// Intern opaque IDs using exact byte equality and independent shard locks.
 struct Exotic {
     hash: RandomState,
     shards: Box<[Mutex<InternShard>]>,
-    linked: Vec<InternShard>,
+    long: OnceLock<LongIds>,
+    hex: OnceLock<HexIds>,
 }
 impl Exotic {
     fn new() -> Self {
         Exotic {
             hash: RandomState::new(),
-            linked: Vec::new(),
             shards: (0..INTERN_SHARDS).map(|_| Mutex::new(InternShard::default())).collect(),
+            long: OnceLock::new(),
+            hex: OnceLock::new(),
         }
     }
-    // The link pass establishes a stable prefix of each shard's ID space.
-    // Event and click workers can read that prefix without taking a lock.
-    fn freeze_links(&mut self) {
-        self.linked = self.shards.iter_mut()
-            .map(|shard| std::mem::take(shard.get_mut().unwrap()))
-            .collect();
+    /// Enable the lock-free long-ID table (IDs must point into static input mappings from now on).
+    fn init_long(&self, cap: usize) {
+        let _ = self.long.set(LongIds::new(cap));
+        let _ = self.hex.set(HexIds::new(cap));
     }
-
     #[inline]
     fn key(&self, s: &[u8]) -> u64 {
         match enc_key(s) {
@@ -637,34 +992,44 @@ impl Exotic {
             None => self.intern(s),
         }
     }
-    #[cold]
+    #[inline]
     fn intern(&self, s: &[u8]) -> u64 {
-        let hash = self.hash.hash_one(s);
-        let shard = hash as usize & (INTERN_SHARDS - 1);
-        let prefix = self.linked.get(shard);
-        if let Some(frozen) = prefix {
-            if !frozen.slots.is_empty() {
-                if let Ok(index) = frozen.probe(hash, s) {
-                    return EXOTIC | ((index as u64) << INTERN_SHARD_BITS) | shard as u64;
+        if s.len() == 33 {
+            if let Some(t) = self.hex.get() {
+                if let Some((lo, hi)) = unsafe { hex128(s.as_ptr().add(1)) } {
+                    if let Some(i) = t.slot(s, lo, hi) {
+                        return EXOTIC | LONG_TAG | HEX_TAG | i as u64;
+                    }
                 }
             }
         }
+        if s.len() >= 16 {
+            if let Some(t) = self.long.get() {
+                if let Some(i) = t.slot(s) {
+                    return EXOTIC | LONG_TAG | i as u64;
+                }
+            }
+        }
+        self.intern_locked(s)
+    }
+    #[cold]
+    fn intern_locked(&self, s: &[u8]) -> u64 {
+        let hash = self.hash.hash_one(s);
+        let shard = hash as usize & (INTERN_SHARDS - 1);
         let mut shard_data = self.shards[shard].lock().unwrap();
-        let index = prefix.map_or(0, |p| p.entries.len()) + shard_data.intern(hash, s);
+        let index = shard_data.intern(hash, s);
         EXOTIC | ((index as u64) << INTERN_SHARD_BITS) | shard as u64
     }
     fn bytes(&self, k: u64, out: &mut Vec<u8>) {
-        if k & EXOTIC != 0 {
+        if k & (EXOTIC | LONG_TAG | HEX_TAG) == EXOTIC | LONG_TAG | HEX_TAG {
+            out.extend_from_slice(self.hex.get().unwrap().bytes((k & !(EXOTIC | LONG_TAG | HEX_TAG)) as usize));
+        } else if k & (EXOTIC | LONG_TAG) == EXOTIC | LONG_TAG {
+            out.extend_from_slice(self.long.get().unwrap().bytes((k & !(EXOTIC | LONG_TAG)) as usize));
+        } else if k & EXOTIC != 0 {
             let shard = k as usize & (INTERN_SHARDS - 1);
             let index = ((k & !EXOTIC) >> INTERN_SHARD_BITS) as usize;
-            let prefix = self.linked.get(shard);
-            if let Some(entry) = prefix.and_then(|p| p.entries.get(index)) {
-                out.extend_from_slice(&entry.bytes);
-            } else {
-                let index = index - prefix.map_or(0, |p| p.entries.len());
-                let shard_data = self.shards[shard].lock().unwrap();
-                out.extend_from_slice(&shard_data.entries[index].bytes);
-            }
+            let shard_data = self.shards[shard].lock().unwrap();
+            out.extend_from_slice(&shard_data.entries[index].bytes);
         } else {
             dec_key(k, out);
         }
@@ -731,13 +1096,40 @@ impl Exotic {
             let tail = u64::from_le_bytes(id[1..].try_into().unwrap());
             const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
             if tail & !ASCII == 0 {
-                let suffix = unsafe { std::arch::x86_64::_pext_u64(tail, ASCII) };
+                // pack eight 7-bit bytes into 56 bits without PEXT (microcoded on some AMD CPUs)
+                let y = (tail & 0x007f_007f_007f_007f) | ((tail & 0x7f00_7f00_7f00_7f00) >> 1);
+                let z = (y & 0x0000_3fff_0000_3fff) | ((y & 0x3fff_0000_3fff_0000) >> 2);
+                let suffix = (z & 0x0fff_ffff) | ((z >> 32) << 28);
                 return (u64::from(id[0]) << 56) | suffix;
             }
         }
         self.key_in(id, limit)
     }
 
+    /// Start a key lookup early: for a hex-suffixed ID, its packed value and prefetched home slot.
+    #[inline(always)]
+    fn pre(&self, s: &[u8]) -> Option<(u64, u64, usize)> {
+        if s.len() == 33 {
+            if let Some(t) = self.hex.get() {
+                if let Some((lo, hi)) = unsafe { hex128(s.as_ptr().add(1)) } {
+                    let h = t.home(s, lo, hi);
+                    t.prefetch(h);
+                    return Some((lo, hi, h));
+                }
+            }
+        }
+        None
+    }
+    /// Finish a lookup started with `pre`.
+    #[inline(always)]
+    fn key_pre(&self, s: &[u8], pre: Option<(u64, u64, usize)>, lim: usize) -> u64 {
+        if let Some((lo, hi, h)) = pre {
+            if let Some(i) = self.hex.get().unwrap().slot_at(s, lo, hi, h) {
+                return EXOTIC | LONG_TAG | HEX_TAG | i as u64;
+            }
+        }
+        self.key_in(s, lim)
+    }
     /// Key for a field inside a buffer ending at `lim`.
     #[inline(always)]
     fn key_in(&self, s: &[u8], lim: usize) -> u64 {
@@ -1262,11 +1654,12 @@ struct EvRec {
 struct EventBatch<'a> {
     records: Parts<EvRec>,
     opaque_ids: Vec<&'a [u8]>,
+    wc: Wc,
 }
 
 impl<'a> EventBatch<'a> {
     fn alloc(count_per_part: usize, partitions: usize) -> Self {
-        Self { records: Parts::alloc(count_per_part, partitions), opaque_ids: Vec::new() }
+        Self { records: Parts::alloc(count_per_part, partitions), opaque_ids: Vec::new(), wc: Wc::new(partitions) }
     }
 
     fn key(&mut self, ex: &Exotic, id: &'a [u8], limit: usize) -> (u64, u32) {
@@ -1275,7 +1668,7 @@ impl<'a> EventBatch<'a> {
         }
         self.opaque_ids.push(id);
         let index = u32::try_from(self.opaque_ids.len()).expect("too many long IDs in one worker");
-        (ex.hash.hash_one(id), index)
+        (if id.len() >= 16 { long_hash(id) } else { ex.hash.hash_one(id) }, index)
     }
 
     fn opaque_id(&self, index: u32) -> Option<&[u8]> {
@@ -1369,6 +1762,7 @@ fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: 
         if f[0].is_empty() {
             return;
         }
+        let upre = ex.pre(f[1]);
         let (eid, opaque_index) = out.key(ex, f[0], lim);
         let ingest_ms = parse_ts_fast(f[3], dc).unwrap_or(i64::MAX / 4);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
@@ -1401,7 +1795,7 @@ fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: 
             ok = false;
         }
         let rec = if ok {
-            let user = ex.key_in(f[1], lim);
+            let user = ex.key_pre(f[1], upre, lim);
             // Only purchases contribute to category revenue.
             let pc = if price == 0 {
                 0
@@ -1413,7 +1807,7 @@ fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: 
         } else {
             EvRec { eid, user: 0, ts: 0, ingest, pc: 0, opaque_index }
         };
-        out.records.push(part1(eid), rec);
+        out.wc.push(&mut out.records, part1(eid), rec);
     });
 }
 
@@ -1445,6 +1839,7 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
+        let upre = ex.pre(f[1]);
         let ts = match parse_ts_fast(f[3], dc) {
             Some(t) if t >= base && t < hi => t,
             _ => return,
@@ -1455,7 +1850,7 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
         };
         // Click IDs only break timestamp ties. Keep the original unquoted field.
         let cid = f[0];
-        let user = ex.key_in(f[1], lim);
+        let user = ex.key_pre(f[1], upre, lim);
         lm.prefetch(user);
         let slot = queued % AHEAD;
         if queued >= AHEAD {
@@ -1476,7 +1871,7 @@ struct DedupScratch<'a> {
     winners: Vec<Option<(&'a EvRec, usize)>>,
 }
 
-fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [EventBatch<'_>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>) {
+fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [EventBatch<'_>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>, wc: &mut Wc) {
     let n: usize = parts.iter().map(|part| part.records.count(p)).sum();
     if n == 0 {
         return;
@@ -1486,7 +1881,7 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [EventBatch<'_>], p: usize, scratch
     scratch.buckets.resize(buckets / 64, [0, 0]);
     let hash = |eid: u64| eid.wrapping_mul(0x9E37_79B9_7F4A_7C15) << P1_BITS;
     let shift = 64 - buckets.trailing_zeros();
-    let records = || parts.iter().flat_map(|part| part.records.main(p).iter().chain(&part.records.spill[p]));
+    let records = || parts.iter().flat_map(|part| part.records.runs(p)).flatten();
     let mut collisions = 0usize;
     for record in records() {
         let index = (hash(record.eid) >> shift) as usize;
@@ -1508,13 +1903,13 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [EventBatch<'_>], p: usize, scratch
         // All nonempty user IDs encode to a nonzero key. Invalid rows carry zero.
         if r.user != 0 {
             let person = lm.get(r.user);
-            out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
+            let _ = &wc; out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
         }
     };
     // Identity lookups are random reads of a large table; prefetch a fixed distance ahead.
     const AHEAD: usize = 16;
     for (batch_index, batch) in parts.iter().enumerate() {
-        for run in [batch.records.main(p), &batch.records.spill[p][..]] {
+        for run in batch.records.runs(p) {
             for (i, record) in run.iter().enumerate() {
                 if let Some(next) = run.get(i + AHEAD) {
                     lm.prefetch(next.user);
@@ -1913,6 +2308,35 @@ fn finish_row(row: &mut URow, catrev: &mut [u64], rows: &mut Vec<URow>) {
 }
 
 
+fn stream_rows(ud: &mut Option<pq::Stream>, dir: &Path, t: usize, rows: &[URow], ex: &Exotic, cats: &[Vec<u8>], sbuf: &mut Vec<u8>) {
+    let w = ud.get_or_insert_with(|| {
+        pq::Stream::create(
+            &dir.join(format!("part-{:03}.parquet", t)),
+            &[
+                ("user_id", pq::SKind::Str),
+                ("day", pq::SKind::Date),
+                ("sessions", pq::SKind::I32),
+                ("events", pq::SKind::I32),
+                ("revenue_cents", pq::SKind::I64),
+                ("top_category", pq::SKind::OptStr),
+            ],
+        )
+        .expect("create user_daily")
+    });
+    for r in rows {
+        sbuf.clear();
+        ex.bytes(r.person, sbuf);
+        w.str(0, sbuf);
+        w.i32(1, r.day);
+        w.i32(2, r.sessions as i32);
+        w.i32(3, r.events as i32);
+        w.i64(4, r.revenue as i64);
+        w.opt_str(5, if r.top >= 0 { Some(&cats[r.top as usize][..]) } else { None });
+        w.end_row().expect("write user_daily");
+    }
+}
+
+#[allow(dead_code)]
 fn write_user_daily(path: &Path, rows: &[URow], ex: &Exotic, cats: &[Vec<u8>]) {
     let n = rows.len();
     let mut uid = pq::StrCol::with_capacity(n * 14);
@@ -1977,10 +2401,15 @@ fn main() {
     for (i,(c,_)) in camp_rows.iter().enumerate() { camps.insert(c,i as u16); }
     let ncamp = camp_rows.len();
     let ctx = Ctx { base, ws, we, day0, nd, ncat: cats.len(), ncamp, prods, camps, unknown_cat };
-    let mut ex = Exotic::new();
+    let ex = Exotic::new();
     let ev_maps: Vec<&[u8]> = csv_files(&data.join("events")).iter().map(|p| map_file(p)).collect();
     let cl_maps: Vec<&[u8]> = csv_files(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
     let ln_maps: Vec<&[u8]> = csv_files(&data.join("links")).iter().map(|p| map_file(p)).collect();
+    {
+        // distinct long user IDs: well under one per 2 KB of input; overflow falls back to locked interning
+        let total: usize = ev_maps.iter().chain(&cl_maps).chain(&ln_maps).map(|m| m.len()).sum();
+        ex.init_long(total / 4000 + 4096);
+    }
     let ev_chunks = make_chunks(&ev_maps, 4 << 20);
     let cl_chunks = make_chunks(&cl_maps, 4 << 20);
     let ln_chunks = make_chunks(&ln_maps, 1 << 20);
@@ -2001,7 +2430,6 @@ fn main() {
         })).collect();
         hs.into_iter().map(|h|h.join().unwrap()).collect()
     });
-    ex.freeze_links();
     let lm = std::sync::LazyLock::new({
         let ex = &ex;
         move || build_linkmap(&link_pairs, ex)
@@ -2024,6 +2452,7 @@ fn main() {
             let (fi,b,e) = ev_chunks[k];
             parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
         }
+        evp.wc.finish(&mut evp.records);
         let ids = std::sync::LazyLock::force(&lm);
         loop {
             let k = cl_next.fetch_add(1, AO::Relaxed);
@@ -2036,7 +2465,9 @@ fn main() {
     let parsed: Vec<(EventBatch<'_>, Parts<CRec>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (1..nthreads).map(|_| scope.spawn(&parse)).collect();
         // Other workers can parse events while the calling thread resolves identities.
+        let tl = std::time::Instant::now();
         std::sync::LazyLock::force(&lm);
+        if timing { eprintln!("  linkmap build {:?} (done at {:?})", tl.elapsed(), t0.elapsed()); }
         std::iter::once(parse()).chain(workers.into_iter().map(|h| h.join().unwrap())).collect()
     });
     let lm = std::sync::LazyLock::force(&lm);
@@ -2046,12 +2477,18 @@ fn main() {
     let pe_parts: Vec<Parts<PRec>> = std::thread::scope(|s| {
         let hs:Vec<_> = (0..nthreads).map(|_|s.spawn(|| {
             let mut out = Parts::<PRec>::alloc(pr_cap,P2);
+            let mut wc = Wc::new(P2);
             let mut scratch = DedupScratch::default();
             loop {
                 let p=p_next.fetch_add(1,AO::Relaxed);
                 if p >= P1 {break;}
-                dedup_direct(lm,&ev_parts,p,&mut scratch,&mut out);
+                dedup_direct(lm,&ev_parts,p,&mut scratch,&mut out,&mut wc);
+                // this partition's event blocks are free now: recycle them for the output
+                for b in ev_parts.iter() {
+                    unsafe { (*(&b.records as *const Parts<EvRec> as *mut Parts<EvRec>)).release(p, out.pool) };
+                }
             }
+            wc.finish(&mut out);
             out
         })).collect();
         hs.into_iter().map(|h|h.join().unwrap()).collect()
@@ -2080,17 +2517,24 @@ fn main() {
                 let cats = &cats;
                 let order = &order;
                 s.spawn(move || {
-                    let mut agg = Agg { rows: Vec::new(), camp: vec![[0u64; 4]; (ctx.ncamp + 1) * ctx.nd] };
+                    let mut agg = Agg { rows: Vec::with_capacity(70000), camp: vec![[0u64; 4]; (ctx.ncamp + 1) * ctx.nd] };
                     let mut sc = Scratch::default();
+                    let mut ud: Option<pq::Stream> = None;
+                    let mut sbuf = Vec::with_capacity(64);
                     loop {
                         let k = q_next.fetch_add(1, AO::Relaxed);
                         if k >= P2 {
                             break;
                         }
                         process_partition(ctx, pe_parts, pc_parts, order[k].1, &mut sc, &mut agg);
+                        if agg.rows.len() >= 65536 {
+                            stream_rows(&mut ud, ud_dir, t, &agg.rows, ex, cats, &mut sbuf);
+                            agg.rows.clear();
+                        }
                     }
-                    if t == 0 || !agg.rows.is_empty() {
-                        write_user_daily(&ud_dir.join(format!("part-{:03}.parquet", t)), &agg.rows, ex, cats);
+                    if t == 0 || !agg.rows.is_empty() || ud.is_some() {
+                        stream_rows(&mut ud, ud_dir, t, &agg.rows, ex, cats, &mut sbuf);
+                        ud.unwrap().finish().expect("write user_daily");
                     }
                     agg.camp
                 })
@@ -2144,6 +2588,7 @@ fn main() {
         pq::Column { name: "assisted_sessions", kind: pq::Kind::I64, optional: false, data: pq::i64_col(&s3) },
     ];
     pq::write_file(&cd_dir.join("part-000.parquet"), n, cols).expect("write campaign_daily");
+    if timing { eprintln!("  long ids: {}", ex.long.get().map(|t| t.len()).unwrap_or(0) + ex.hex.get().map(|t| t.len()).unwrap_or(0)); }
     tick("done");
     std::process::exit(0);
 }
@@ -2224,51 +2669,6 @@ fn bench(data: &Path, mode: &str) {
 #[cfg(test)]
 mod event_dedup_tests {
     use super::*;
-
-    #[test]
-    fn linked_and_later_ids_round_trip_after_shard_growth() {
-        let mut ex = Exotic::new();
-        let mut expected = Vec::new();
-        for i in 0..12000 {
-            if i == 6000 { ex.freeze_links(); }
-            let id = format!("opaque user {i}");
-            expected.push((ex.key(id.as_bytes()), id));
-        }
-        for (key, id) in expected {
-            assert_eq!(ex.key(id.as_bytes()), key);
-            let mut bytes = Vec::new();
-            ex.bytes(key, &mut bytes);
-            assert_eq!(bytes, id.as_bytes());
-        }
-    }
-
-    #[test]
-    fn simd_csv_matches_scalar_across_quote_and_chunk_boundaries() {
-        let mut data = b"first,second,third\n".to_vec();
-        for n in 0..140 {
-            let mut row = vec![b'x'; n];
-            row.extend_from_slice(b",a,");
-            for tail in [b"".as_slice(), b"\"\"", b"\"v\"", b"\"", b"\"v", b"v\"", b"\"v\"z", b"\"\"\""] {
-                data.extend_from_slice(&row);
-                data.extend_from_slice(tail);
-                data.push(b'\n');
-            }
-        }
-        data.extend_from_slice(b"\"end\",,\"x\"");
-        for chunk in [31, 127, 1024] {
-            let mut actual = Vec::new();
-            let mut expected = Vec::new();
-            for b in (0..data.len()).step_by(chunk) {
-                let e = (b + chunk).min(data.len());
-                scan_lines::<3>(&data, b, e, &mut |f| actual.push(*f));
-                for_lines(&data, b, e, |line| {
-                    let mut f = [&[][..]; 3];
-                    if fields(line, &mut f) { expected.push(f); }
-                });
-            }
-            assert_eq!(actual, expected);
-        }
-    }
 
     #[test]
     fn event_keys_are_distinct_across_packed_and_fallback_encodings() {

@@ -284,3 +284,209 @@ pub fn write_file(path: &std::path::Path, rows: usize, cols: Vec<Column>) -> std
     f.write_all(&(m.buf.len() as u32).to_le_bytes())?;
     f.write_all(b"PAR1")
 }
+
+// ------------------------------------------------------------------ streaming writer
+/// Physical/logical type of a streamed column.
+#[derive(Clone, Copy)]
+pub enum SKind {
+    Str,    // BYTE_ARRAY UTF8
+    OptStr, // optional BYTE_ARRAY UTF8
+    I32,    // INT32
+    I64,    // INT64
+    Date,   // INT32 DATE
+}
+fn sphys(k: SKind) -> i32 {
+    match k {
+        SKind::Str | SKind::OptStr => 6,
+        SKind::I32 | SKind::Date => 1,
+        SKind::I64 => 2,
+    }
+}
+
+/// Writes a Parquet file row group by row group from small reusable column buffers.
+pub struct Stream {
+    file: std::io::BufWriter<std::fs::File>,
+    off: u64,
+    names: Vec<&'static str>,
+    kinds: Vec<SKind>,
+    pub vals: Vec<Vec<u8>>, // PLAIN values per column
+    pub defs: Vec<u8>,      // definition bits of the (single) optional column, packed LSB first
+    pub nnull_rows: usize,  // rows in the current group
+    groups: Vec<(usize, Vec<(u64, u64)>)>, // (rows, per column (offset, size))
+    total_rows: usize,
+}
+impl Stream {
+    pub fn create(path: &std::path::Path, cols: &[(&'static str, SKind)]) -> std::io::Result<Self> {
+        let f = std::fs::File::create(path)?;
+        let mut file = std::io::BufWriter::with_capacity(1 << 20, f);
+        use std::io::Write;
+        file.write_all(b"PAR1")?;
+        Ok(Stream {
+            file,
+            off: 4,
+            names: cols.iter().map(|c| c.0).collect(),
+            kinds: cols.iter().map(|c| c.1).collect(),
+            vals: cols.iter().map(|_| Vec::with_capacity(1 << 20)).collect(),
+            defs: Vec::with_capacity(1 << 14),
+            nnull_rows: 0,
+            groups: Vec::new(),
+            total_rows: 0,
+        })
+    }
+    #[inline(always)]
+    pub fn str(&mut self, c: usize, s: &[u8]) {
+        let v = &mut self.vals[c];
+        v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        v.extend_from_slice(s);
+    }
+    #[inline(always)]
+    pub fn opt_str(&mut self, c: usize, s: Option<&[u8]>) {
+        let i = self.nnull_rows;
+        if i & 7 == 0 {
+            self.defs.push(0);
+        }
+        if let Some(s) = s {
+            *self.defs.last_mut().unwrap() |= 1 << (i & 7);
+            self.str(c, s);
+        }
+    }
+    #[inline(always)]
+    pub fn i32(&mut self, c: usize, x: i32) {
+        self.vals[c].extend_from_slice(&x.to_le_bytes());
+    }
+    #[inline(always)]
+    pub fn i64(&mut self, c: usize, x: i64) {
+        self.vals[c].extend_from_slice(&x.to_le_bytes());
+    }
+    /// Call after all columns of a row are pushed.
+    #[inline(always)]
+    pub fn end_row(&mut self) -> std::io::Result<()> {
+        self.nnull_rows += 1;
+        if self.nnull_rows == 65536 {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let rows = self.nnull_rows;
+        if rows == 0 {
+            return Ok(());
+        }
+        let mut metas = Vec::with_capacity(self.kinds.len());
+        for c in 0..self.kinds.len() {
+            let mut prefix: Vec<u8> = Vec::new();
+            if let SKind::OptStr = self.kinds[c] {
+                // RLE/bit-packed hybrid, bit width 1: one bit-packed run of ceil(rows/8) groups
+                let groups = (rows + 7) / 8;
+                let mut rle = Vec::with_capacity(groups + 10);
+                varint(&mut rle, ((groups as u64) << 1) | 1);
+                rle.extend_from_slice(&self.defs[..groups]);
+                prefix.extend_from_slice(&(rle.len() as u32).to_le_bytes());
+                prefix.extend_from_slice(&rle);
+            }
+            let body = prefix.len() + self.vals[c].len();
+            let mut h = Tw::new();
+            h.i32f(1, 0); // DATA_PAGE
+            h.i32f(2, body as i32);
+            h.i32f(3, body as i32);
+            h.sbegin(5);
+            h.i32f(1, rows as i32);
+            h.i32f(2, 0); // PLAIN
+            h.i32f(3, 3); // RLE
+            h.i32f(4, 3); // RLE
+            h.send();
+            h.buf.push(0);
+            let start = self.off;
+            self.file.write_all(&h.buf)?;
+            self.file.write_all(&prefix)?;
+            self.file.write_all(&self.vals[c])?;
+            self.off += (h.buf.len() + body) as u64;
+            metas.push((start, self.off - start));
+            self.vals[c].clear();
+        }
+        self.defs.clear();
+        self.groups.push((rows, metas));
+        self.total_rows += rows;
+        self.nnull_rows = 0;
+        Ok(())
+    }
+    pub fn finish(mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        self.flush()?;
+        let mut m = Tw::new();
+        m.i32f(1, 1);
+        m.lbegin(2, T_STRUCT, self.kinds.len() + 1);
+        m.elem_sbegin();
+        m.binf(4, b"schema");
+        m.i32f(5, self.kinds.len() as i32);
+        m.send();
+        for c in 0..self.kinds.len() {
+            let k = self.kinds[c];
+            m.elem_sbegin();
+            m.i32f(1, sphys(k));
+            m.i32f(3, if let SKind::OptStr = k { 1 } else { 0 });
+            m.binf(4, self.names[c].as_bytes());
+            match k {
+                SKind::Str | SKind::OptStr => {
+                    m.i32f(6, 0); // UTF8
+                    m.sbegin(10);
+                    m.sbegin(1); // STRING
+                    m.send();
+                    m.send();
+                }
+                SKind::Date => {
+                    m.i32f(6, 6); // DATE
+                    m.sbegin(10);
+                    m.sbegin(6); // DATE
+                    m.send();
+                    m.send();
+                }
+                SKind::I32 | SKind::I64 => {}
+            }
+            m.send();
+        }
+        m.i64f(3, self.total_rows as i64);
+        m.lbegin(4, T_STRUCT, self.groups.len());
+        for (rows, metas) in &self.groups {
+            m.elem_sbegin();
+            m.lbegin(1, T_STRUCT, self.kinds.len());
+            let mut total = 0i64;
+            for c in 0..self.kinds.len() {
+                let (off, size) = metas[c];
+                let k = self.kinds[c];
+                total += size as i64;
+                m.elem_sbegin();
+                m.i64f(2, off as i64);
+                m.sbegin(3);
+                m.i32f(1, sphys(k));
+                if let SKind::OptStr = k {
+                    m.lbegin(2, T_I32, 2);
+                    m.elem_i32(0);
+                    m.elem_i32(3);
+                } else {
+                    m.lbegin(2, T_I32, 1);
+                    m.elem_i32(0);
+                }
+                m.lbegin(3, T_BIN, 1);
+                m.elem_bin(self.names[c].as_bytes());
+                m.i32f(4, 0); // UNCOMPRESSED
+                m.i64f(5, *rows as i64);
+                m.i64f(6, size as i64);
+                m.i64f(7, size as i64);
+                m.i64f(9, off as i64);
+                m.send();
+                m.send();
+            }
+            m.i64f(2, total);
+            m.i64f(3, *rows as i64);
+            m.send();
+        }
+        m.binf(6, b"ss");
+        m.buf.push(0);
+        self.file.write_all(&m.buf)?;
+        self.file.write_all(&(m.buf.len() as u32).to_le_bytes())?;
+        self.file.write_all(b"PAR1")?;
+        self.file.flush()
+    }
+}
