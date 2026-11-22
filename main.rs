@@ -1775,28 +1775,29 @@ fn finish_row(row: &mut URow, catrev: &mut [u64], rows: &mut Vec<URow>) {
 fn write_user_daily(path: &Path, rows: &[URow], ex: &Exotic, cats: &[Vec<u8>]) {
     let n = rows.len();
     let mut uid = pq::StrCol::with_capacity(n * 14);
-    let mut day = Vec::with_capacity(n);
-    let mut sessions = Vec::with_capacity(n);
-    let mut events = Vec::with_capacity(n);
-    let mut revenue = Vec::with_capacity(n);
+    // PLAIN integer columns are little-endian values back to back: encode them in place.
+    let mut day = Vec::with_capacity(n * 4);
+    let mut sessions = Vec::with_capacity(n * 8);
+    let mut events = Vec::with_capacity(n * 8);
+    let mut revenue = Vec::with_capacity(n * 8);
     let mut top = pq::OptStrCol::with_capacity(n);
     let mut sbuf = Vec::with_capacity(16);
     for r in rows {
         sbuf.clear();
         ex.bytes(r.person, &mut sbuf);
         uid.push(&sbuf);
-        day.push(r.day);
-        sessions.push(r.sessions as i64);
-        events.push(r.events as i64);
-        revenue.push(r.revenue as i64);
+        day.extend_from_slice(&r.day.to_le_bytes());
+        sessions.extend_from_slice(&(r.sessions as i64).to_le_bytes());
+        events.extend_from_slice(&(r.events as i64).to_le_bytes());
+        revenue.extend_from_slice(&(r.revenue as i64).to_le_bytes());
         top.push(if r.top >= 0 { Some(&cats[r.top as usize][..]) } else { None });
     }
     let cols = vec![
         pq::Column { name: "user_id", kind: pq::Kind::Str, optional: false, data: uid.buf },
-        pq::Column { name: "day", kind: pq::Kind::Date, optional: false, data: pq::i32_col(&day) },
-        pq::Column { name: "sessions", kind: pq::Kind::I64, optional: false, data: pq::i64_col(&sessions) },
-        pq::Column { name: "events", kind: pq::Kind::I64, optional: false, data: pq::i64_col(&events) },
-        pq::Column { name: "revenue_cents", kind: pq::Kind::I64, optional: false, data: pq::i64_col(&revenue) },
+        pq::Column { name: "day", kind: pq::Kind::Date, optional: false, data: day },
+        pq::Column { name: "sessions", kind: pq::Kind::I64, optional: false, data: sessions },
+        pq::Column { name: "events", kind: pq::Kind::I64, optional: false, data: events },
+        pq::Column { name: "revenue_cents", kind: pq::Kind::I64, optional: false, data: revenue },
         pq::Column { name: "top_category", kind: pq::Kind::Str, optional: true, data: top.finish() },
     ];
     pq::write_file(path, n, cols).expect("write user_daily");

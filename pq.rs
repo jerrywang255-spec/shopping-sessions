@@ -179,13 +179,14 @@ fn phys(k: &Kind) -> i32 {
 }
 
 /// Write a parquet file holding `rows` rows in the given columns.
+/// Column bodies go straight from their buffers to the file, without assembling a second copy.
 pub fn write_file(path: &std::path::Path, rows: usize, cols: Vec<Column>) -> std::io::Result<()> {
-    let mut out: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.data.len() + 64).sum::<usize>() + 4096);
-    out.extend_from_slice(b"PAR1");
+    use std::io::Write;
+    let mut heads: Vec<Vec<u8>> = Vec::with_capacity(cols.len());
     let mut metas = Vec::new(); // (offset, total size)
+    let mut end = 4; // after the leading "PAR1"
     if rows > 0 {
         for c in &cols {
-            let off = out.len();
             let mut h = Tw::new();
             h.i32f(1, 0); // DATA_PAGE
             h.i32f(2, c.data.len() as i32);
@@ -197,9 +198,10 @@ pub fn write_file(path: &std::path::Path, rows: usize, cols: Vec<Column>) -> std
             h.i32f(4, 3); // RLE
             h.send();
             h.buf.push(0);
-            out.extend_from_slice(&h.buf);
-            out.extend_from_slice(&c.data);
-            metas.push((off, out.len() - off));
+            let size = h.buf.len() + c.data.len();
+            metas.push((end, size));
+            end += size;
+            heads.push(h.buf);
         }
     }
     let mut m = Tw::new();
@@ -272,8 +274,13 @@ pub fn write_file(path: &std::path::Path, rows: usize, cols: Vec<Column>) -> std
     }
     m.binf(6, b"ss");
     m.buf.push(0);
-    out.extend_from_slice(&m.buf);
-    out.extend_from_slice(&(m.buf.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    std::fs::write(path, &out)
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(b"PAR1")?;
+    for (h, c) in heads.iter().zip(&cols) {
+        f.write_all(h)?;
+        f.write_all(&c.data)?;
+    }
+    f.write_all(&m.buf)?;
+    f.write_all(&(m.buf.len() as u32).to_le_bytes())?;
+    f.write_all(b"PAR1")
 }
