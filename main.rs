@@ -482,47 +482,36 @@ impl<T: Copy> Parts<T> {
 }
 
 // ------------------------------------------------------------------ keys
-const fn build_enc() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut i = 0;
-    while i < 10 {
-        t[b'0' as usize + i] = 1 + i as u8;
-        i += 1;
-    }
-    i = 0;
-    while i < 26 {
-        t[b'A' as usize + i] = 11 + i as u8;
-        t[b'a' as usize + i] = 37 + i as u8;
-        i += 1;
-    }
-    t
-}
-static ENC: [u8; 256] = build_enc();
-const DEC: &[u8; 63] = b"\x000123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
+// Pack up to nine ASCII bytes into a u64, most significant character first.
+// Zero padding preserves bytewise order. A trailing NUL uses the exact interner.
 #[inline]
 fn enc_key(s: &[u8]) -> Option<u64> {
-    if s.len() > 10 || s.is_empty() {
+    if s.is_empty() || s.len() > 9 || s.last() == Some(&0) {
         return None;
     }
-    let mut v = 0u64;
-    for &c in s {
-        let e = ENC[c as usize];
-        if e == 0 {
+    let mut key = 0u64;
+    for &byte in s {
+        if !byte.is_ascii() {
             return None;
         }
-        v = (v << 6) | e as u64;
+        key = (key << 7) | u64::from(byte);
     }
-    Some(v << (6 * (10 - s.len())))
+    Some(key << (7 * (9 - s.len())))
 }
 
-fn dec_key(k: u64, out: &mut Vec<u8>) {
-    for i in 0..10 {
-        let c = ((k >> (54 - 6 * i)) & 63) as usize;
-        if c == 0 {
-            break;
-        }
-        out.push(DEC[c]);
+#[inline]
+fn dec_key(key: u64, out: &mut Vec<u8>) {
+    debug_assert_ne!(key, 0);
+    let len = 9 - key.trailing_zeros() as usize / 7;
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let prefix = unsafe { std::arch::x86_64::_pdep_u64(key >> 7, 0x7f7f_7f7f_7f7f_7f7f) };
+        out.extend_from_slice(&prefix.to_be_bytes()[..len.min(8)]);
+        if len == 9 { out.push((key & 127) as u8); }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    for i in 0..len {
+        out.push(((key >> (7 * (8 - i))) & 127) as u8);
     }
 }
 
@@ -632,7 +621,7 @@ impl Exotic {
 
     #[inline]
     fn key(&self, s: &[u8]) -> u64 {
-        match enc_key(s) {
+        match pack_ascii(s) {
             Some(k) => k,
             None => self.intern(s),
         }
@@ -688,71 +677,30 @@ impl Exotic {
 }
 
 
-/// Fast compact key for a field known to have 16 readable bytes from its start.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 #[inline(always)]
-unsafe fn enc_key16(s: &[u8]) -> Option<u64> {
-    use std::arch::x86_64::*;
-    let l = s.len();
-    if l == 0 || l > 10 {
+fn pack_ascii(s: &[u8]) -> Option<u64> {
+    let len = s.len();
+    let prefix = match len {
+        8 | 9 => u64::from_be_bytes(s[..8].try_into().unwrap()),
+        4..=7 => {
+            // Overlapping loads put each byte in its big-endian lane.
+            let head = u32::from_be_bytes(s[..4].try_into().unwrap());
+            let tail = u32::from_be_bytes(s[len - 4..].try_into().unwrap());
+            (u64::from(head) << 32) | (u64::from(tail) << (8 * (8 - len)))
+        }
+        _ => return enc_key(s),
+    };
+    let last = if len == 9 { s[8] } else { 0 };
+    const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    if s[len - 1] == 0 || prefix & !ASCII != 0 || !last.is_ascii() {
         return None;
     }
-    let c = _mm_loadu_si128(s.as_ptr() as *const __m128i);
-    let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    let lm = _mm_cmpgt_epi8(_mm_set1_epi8(l as i8), idx);
-    let d = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(b'0' as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(b'9' as i8 + 1), c));
-    let u = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(b'A' as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(b'Z' as i8 + 1), c));
-    let lo = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(b'a' as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(b'z' as i8 + 1), c));
-    let valid = _mm_or_si128(_mm_or_si128(d, u), lo);
-    let need = _mm_movemask_epi8(lm);
-    if _mm_movemask_epi8(_mm_and_si128(valid, lm)) != need {
-        return None;
-    }
-    let code = _mm_or_si128(
-        _mm_or_si128(_mm_and_si128(_mm_sub_epi8(c, _mm_set1_epi8(47)), d), _mm_and_si128(_mm_sub_epi8(c, _mm_set1_epi8(54)), u)),
-        _mm_and_si128(_mm_sub_epi8(c, _mm_set1_epi8(60)), lo),
-    );
-    let code = _mm_and_si128(code, lm);
-    let w = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140)); // bytes (64, 1)
-    let dw = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // words (4096, 1)
-    let a = _mm_cvtsi128_si32(dw) as u32 as u64;
-    let b = _mm_extract_epi32(dw, 1) as u32 as u64;
-    let cc = _mm_extract_epi32(dw, 2) as u32 as u64;
-    Some((a << 36) | (b << 12) | (cc >> 12))
+    Some((unsafe { std::arch::x86_64::_pext_u64(prefix, ASCII) } << 7) | u64::from(last))
 }
 
-impl Exotic {
-    // Event keys need equality only. Nine ASCII bytes fit in 63 bits, and a
-    // first byte >= 16 keeps these keys above the 60-bit compact alphabet.
-    #[inline(always)]
-    fn event_key(&self, id: &[u8], limit: usize) -> u64 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-        if id.len() == 9 && (16..128).contains(&id[0]) {
-            let tail = u64::from_le_bytes(id[1..].try_into().unwrap());
-            const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
-            if tail & !ASCII == 0 {
-                let suffix = unsafe { std::arch::x86_64::_pext_u64(tail, ASCII) };
-                return (u64::from(id[0]) << 56) | suffix;
-            }
-        }
-        self.key_in(id, limit)
-    }
-
-    /// Key for a field inside a buffer ending at `lim`.
-    #[inline(always)]
-    fn key_in(&self, s: &[u8], lim: usize) -> u64 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if (s.as_ptr() as usize) + 16 <= lim {
-                if let Some(k) = unsafe { enc_key16(s) } {
-                    return k;
-                }
-                return self.intern(s);
-            }
-        }
-        self.key(s)
-    }
-}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+use enc_key as pack_ascii;
 
 #[inline]
 fn hmix(k: u64) -> u64 {
@@ -1269,9 +1217,9 @@ impl<'a> EventBatch<'a> {
         Self { records: Parts::alloc(count_per_part, partitions), opaque_ids: Vec::new() }
     }
 
-    fn key(&mut self, ex: &Exotic, id: &'a [u8], limit: usize) -> (u64, u32) {
+    fn key(&mut self, ex: &Exotic, id: &'a [u8]) -> (u64, u32) {
         if id.len() <= 10 {
-            return (ex.event_key(id, limit), 0);
+            return (ex.key(id), 0);
         }
         self.opaque_ids.push(id);
         let index = u32::try_from(self.opaque_ids.len()).expect("too many long IDs in one worker");
@@ -1364,12 +1312,11 @@ fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: 
     let base = ctx.base;
     let lo = ctx.ws;
     let hi = ctx.we;
-    let lim = m.as_ptr() as usize + m.len();
     scan_lines::<7>(m, b, e, &mut |f: &[&[u8]; 7]| {
         if f[0].is_empty() {
             return;
         }
-        let (eid, opaque_index) = out.key(ex, f[0], lim);
+        let (eid, opaque_index) = out.key(ex, f[0]);
         let ingest_ms = parse_ts_fast(f[3], dc).unwrap_or(i64::MAX / 4);
         let ingest = (ingest_ms.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
         let mut ok = !f[1].is_empty() && !f[5].is_empty();
@@ -1401,7 +1348,7 @@ fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: 
             ok = false;
         }
         let rec = if ok {
-            let user = ex.key_in(f[1], lim);
+            let user = ex.key(f[1]);
             // Only purchases contribute to category revenue.
             let pc = if price == 0 {
                 0
@@ -1419,12 +1366,11 @@ fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: 
 
 
 fn parse_links(ex: &Exotic, m: &[u8], b: usize, e: usize, out: &mut Vec<(u64, u64)>) {
-    let lim = m.as_ptr() as usize + m.len();
     scan_lines::<2>(m, b, e, &mut |f: &[&[u8]; 2]| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        out.push((ex.key_in(f[0], lim), ex.key_in(f[1], lim)));
+        out.push((ex.key(f[0]), ex.key(f[1])));
     });
 }
 
@@ -1432,7 +1378,6 @@ fn parse_links(ex: &Exotic, m: &[u8], b: usize, e: usize, out: &mut Vec<(u64, u6
 fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &'a [u8], b: usize, e: usize, out: &mut Parts<CRec<'a>>) {
     let base = ctx.base;
     let hi = ctx.we;
-    let lim = m.as_ptr() as usize + m.len();
     // Identity lookups wait in a short FIFO so their table slots can be prefetched first.
     const AHEAD: usize = 16;
     let mut ring = [CRec { person: 0, cid: &[], ts: 0, camp: 0 }; AHEAD];
@@ -1455,7 +1400,7 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
         };
         // Click IDs only break timestamp ties. Keep the original unquoted field.
         let cid = f[0];
-        let user = ex.key_in(f[1], lim);
+        let user = ex.key(f[1]);
         lm.prefetch(user);
         let slot = queued % AHEAD;
         if queued >= AHEAD {
@@ -2185,20 +2130,14 @@ fn bench(data: &Path, mode: &str) {
                 acc = acc.wrapping_add(parse_ts_fast(f[2], &mut dc).unwrap_or(0) as u64).wrapping_add(parse_ts_fast(f[3], &mut dc).unwrap_or(0) as u64);
             }),
             "keycheck" => scan_lines::<7>(m, 0, m.len(), &mut |f: &[&[u8]; 7]| {
-                let lim = m.as_ptr() as usize + m.len();
                 for k in 0..7 {
                     let a = enc_key(f[k]);
-                    let b = if (f[k].as_ptr() as usize) + 16 <= lim { unsafe { enc_key16(f[k]) } } else { a };
+                    let b = pack_ascii(f[k]);
                     if a != b { cnt += 1; if cnt < 5 { eprintln!("mismatch {:?} {:?} {:?}", String::from_utf8_lossy(f[k]), a, b); } }
                     acc += 1;
                 }
             }),
-            "keys2" => scan_lines::<7>(m, 0, m.len(), &mut |f: &[&[u8]; 7]| {
-                let lim = m.as_ptr() as usize + m.len();
-                cnt += 1;
-                acc = acc.wrapping_add(ex.key_in(f[0], lim)).wrapping_add(ex.key_in(f[1], lim));
-            }),
-            "keys" => scan_lines::<7>(m, 0, m.len(), &mut |f: &[&[u8]; 7]| {
+            "keys" | "keys2" => scan_lines::<7>(m, 0, m.len(), &mut |f: &[&[u8]; 7]| {
                 cnt += 1;
                 acc = acc.wrapping_add(ex.key(f[0])).wrapping_add(ex.key(f[1]));
             }),
@@ -2278,9 +2217,11 @@ mod event_dedup_tests {
             let mut input = [0u8; 32];
             input[..id.len()].copy_from_slice(id);
             let field = &input[..id.len()];
-            let start = input.as_ptr() as usize;
-            let key = keys.event_key(field, start + input.len());
-            assert_eq!(key, keys.event_key(field, start + field.len()));
+            let key = keys.key(field);
+            let mut decoded = Vec::new();
+            keys.bytes(key, &mut decoded);
+            assert_eq!(decoded, id);
+            assert_eq!(enc_key(field), pack_ascii(field));
             if let Some(previous) = seen.insert(key, id.to_vec()) {
                 assert_eq!(previous, id);
             }
