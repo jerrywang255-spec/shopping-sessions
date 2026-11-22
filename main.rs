@@ -561,7 +561,8 @@ struct Parts<T: Copy> {
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
 unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 impl<T: Copy> Parts<T> {
-    const PER: usize = BLK / std::mem::size_of::<T>();
+    // a multiple of 8 so write groups never straddle blocks
+    const PER: usize = (BLK / std::mem::size_of::<T>()) / 8 * 8;
     /// `_count_per_part` is a sizing hint kept for the callers; memory grows on demand.
     fn alloc(_count_per_part: usize, np: usize) -> Self {
         let pool = Box::into_raw(Box::new(Pool::new()));
@@ -645,19 +646,27 @@ impl<T: Copy> Parts<T> {
 /// and go to memory with non-temporal stores (no read-for-ownership, no cache pollution).
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct Line([u8; 64]);
+struct Line([u8; 192]);
+/// Records per write group: a whole number of 64-byte lines (2 x 32 B, 4 x 16 B, 8 x 24 B).
+const fn wc_group(sz: usize) -> usize {
+    if sz == 24 { 8 } else if 64 % sz == 0 { 64 / sz } else { 1 }
+}
 struct Wc {
     stage: Vec<Line>,
     fill: Vec<u8>,
 }
 impl Wc {
     fn new(np: usize) -> Self {
-        Wc { stage: vec![Line([0; 64]); np], fill: vec![0; np] }
+        Wc { stage: vec![Line([0; 192]); np], fill: vec![0; np] }
     }
     #[inline(always)]
     fn push<T: Copy>(&mut self, parts: &mut Parts<T>, p: usize, x: T) {
         let sz = std::mem::size_of::<T>();
-        let r = 64 / sz;
+        let r = wc_group(sz);
+        if r == 1 {
+            parts.push(p, x);
+            return;
+        }
         unsafe {
             let f = *self.fill.get_unchecked(p) as usize;
             let line = self.stage.get_unchecked_mut(p).0.as_mut_ptr();
@@ -671,10 +680,12 @@ impl Wc {
             #[cfg(target_arch = "x86_64")]
             {
                 use std::arch::x86_64::*;
-                let a = _mm256_load_si256(line as *const __m256i);
-                let b = _mm256_load_si256(line.add(32) as *const __m256i);
-                _mm256_stream_si256(dst as *mut __m256i, a);
-                _mm256_stream_si256(dst.add(32) as *mut __m256i, b);
+                let mut o = 0;
+                while o < r * sz {
+                    let a = _mm256_load_si256(line.add(o) as *const __m256i);
+                    _mm256_stream_si256(dst.add(o) as *mut __m256i, a);
+                    o += 32;
+                }
             }
         }
     }
@@ -1696,15 +1707,34 @@ struct EvRec {
     opaque_index: u32,
 }
 
+/// Most events in 24 bytes: no purchase price and a short event ID.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Ev24 {
+    eid: u64,
+    user: u64,
+    ts: u32,
+    ingest: u32,
+}
+impl Ev24 {
+    #[inline(always)]
+    fn full(&self) -> EvRec {
+        EvRec { eid: self.eid, user: self.user, ts: self.ts, ingest: self.ingest, pc: 0, opaque_index: 0 }
+    }
+}
+
 struct EventBatch<'a> {
+    // purchases and long event IDs (full records)
     records: Parts<EvRec>,
+    compact: Parts<Ev24>,
     opaque_ids: Vec<&'a [u8]>,
     wc: Wc,
+    wc2: Wc,
 }
 
 impl<'a> EventBatch<'a> {
     fn alloc(count_per_part: usize, partitions: usize) -> Self {
-        Self { records: Parts::alloc(count_per_part, partitions), opaque_ids: Vec::new(), wc: Wc::new(partitions) }
+        Self { records: Parts::alloc(count_per_part, partitions), compact: Parts::alloc(count_per_part, partitions), opaque_ids: Vec::new(), wc: Wc::new(partitions), wc2: Wc::new(partitions) }
     }
 
     fn key(&mut self, ex: &Exotic, id: &'a [u8], limit: usize) -> (u64, u32) {
@@ -1730,11 +1760,37 @@ struct PRec {
     pc: u32,
 }
 
+/// A borrowed input field in 8 bytes: 47-bit pointer and 17-bit length. A field longer than
+/// that (never seen in practice) ends at the first delimiter after its start.
+#[derive(Clone, Copy)]
+struct Fid<'a>(u64, std::marker::PhantomData<&'a [u8]>);
+const FID_LONG: u64 = (1 << 17) - 1;
+impl<'a> Fid<'a> {
+    #[inline(always)]
+    fn new(s: &'a [u8]) -> Self {
+        let l = (s.len() as u64).min(FID_LONG);
+        Fid((s.as_ptr() as u64) | (l << 47), std::marker::PhantomData)
+    }
+    #[inline(always)]
+    fn get(&self) -> &'a [u8] {
+        let p = (self.0 & ((1 << 47) - 1)) as *const u8;
+        let mut l = (self.0 >> 47) as usize;
+        unsafe {
+            if l as u64 == FID_LONG {
+                while !matches!(*p.add(l), b',' | b'"' | b'\n') {
+                    l += 1;
+                }
+            }
+            std::slice::from_raw_parts(p, l)
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CRec<'a> {
     person: u64,
-    cid: &'a [u8],
+    cid: Fid<'a>,
     ts: u32,
     camp: u32,
 }
@@ -1852,7 +1908,11 @@ fn parse_events<'a>(ctx: &Ctx, ex: &Exotic, dc: &mut DateCache, m: &'a [u8], b: 
         } else {
             EvRec { eid, user: 0, ts: 0, ingest, pc: 0, opaque_index }
         };
-        out.wc.push(&mut out.records, part1(eid), rec);
+        if rec.pc == 0 && rec.opaque_index == 0 {
+            out.wc2.push(&mut out.compact, part1(eid), Ev24 { eid: rec.eid, user: rec.user, ts: rec.ts, ingest: rec.ingest });
+        } else {
+            out.wc.push(&mut out.records, part1(eid), rec);
+        }
     });
 }
 
@@ -1874,7 +1934,7 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
     let lim = m.as_ptr() as usize + m.len();
     // Identity lookups wait in a short FIFO so their table slots can be prefetched first.
     const AHEAD: usize = 16;
-    let mut ring = [CRec { person: 0, cid: &[], ts: 0, camp: 0 }; AHEAD];
+    let mut ring = [CRec { person: 0, cid: Fid::new(&[]), ts: 0, camp: 0 }; AHEAD];
     let mut queued = 0usize;
     let resolve = |r: CRec<'a>, out: &mut Parts<CRec<'a>>| {
         let person = lm.get(r.person);
@@ -1894,7 +1954,7 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
             None => return,
         };
         // Click IDs only break timestamp ties. Keep the original unquoted field.
-        let cid = f[0];
+        let cid = Fid::new(f[0]);
         let user = ex.key_pre(f[1], upre, lim);
         lm.prefetch(user);
         let slot = queued % AHEAD;
@@ -1913,11 +1973,12 @@ fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCa
 struct DedupScratch<'a> {
     // Each word tracks 64 hash buckets. The second mask flags buckets visited twice.
     buckets: Vec<[u64; 2]>,
-    winners: Vec<Option<(&'a EvRec, usize)>>,
+    winners: Vec<Option<(EvRec, usize)>>,
+    _p: std::marker::PhantomData<&'a ()>,
 }
 
 fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [EventBatch<'_>], p: usize, scratch: &mut DedupScratch<'a>, out: &mut Parts<PRec>, wc: &mut Wc) {
-    let n: usize = parts.iter().map(|part| part.records.count(p)).sum();
+    let n: usize = parts.iter().map(|part| part.records.count(p) + part.compact.count(p)).sum();
     if n == 0 {
         return;
     }
@@ -1926,16 +1987,29 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [EventBatch<'_>], p: usize, scratch
     scratch.buckets.resize(buckets / 64, [0, 0]);
     let hash = |eid: u64| eid.wrapping_mul(0x9E37_79B9_7F4A_7C15) << P1_BITS;
     let shift = 64 - buckets.trailing_zeros();
-    let records = || parts.iter().flat_map(|part| part.records.runs(p)).flatten();
     let mut collisions = 0usize;
-    for record in records() {
-        let index = (hash(record.eid) >> shift) as usize;
-        let bit = 1u64 << (index % 64);
-        let state = &mut scratch.buckets[index / 64];
-        let already_seen = state[0] & bit;
-        state[1] |= already_seen;
-        state[0] |= bit;
-        collisions += usize::from(already_seen != 0);
+    {
+        let mut mark = |eid: u64| {
+            let index = (hash(eid) >> shift) as usize;
+            let bit = 1u64 << (index % 64);
+            let state = &mut scratch.buckets[index / 64];
+            let already_seen = state[0] & bit;
+            state[1] |= already_seen;
+            state[0] |= bit;
+            collisions += usize::from(already_seen != 0);
+        };
+        for part in parts {
+            for run in part.compact.runs(p) {
+                for r in run {
+                    mark(r.eid);
+                }
+            }
+            for run in part.records.runs(p) {
+                for r in run {
+                    mark(r.eid);
+                }
+            }
+        }
     }
 
     // A bucket with k >= 2 records contributes k-1 collisions, so at most
@@ -1944,49 +2018,71 @@ fn dedup_direct<'a>(lm: &LinkMap, parts: &'a [EventBatch<'_>], p: usize, scratch
     scratch.winners.clear();
     scratch.winners.resize(capacity, None);
     let table_shift = 64 - capacity.trailing_zeros();
-    let mut emit = |r: &EvRec| {
+    let emit = |r: &EvRec, out: &mut Parts<PRec>| {
         // All nonempty user IDs encode to a nonzero key. Invalid rows carry zero.
         if r.user != 0 {
             let person = lm.get(r.user);
-            let _ = &wc; out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
+            out.push(part2(person), PRec { person, ts: r.ts, pc: r.pc });
+        }
+    };
+    let _ = &wc;
+    let buckets_ref = &scratch.buckets;
+    let winners = &mut scratch.winners;
+    let mut consider = |record: EvRec, batch_index: usize, out: &mut Parts<PRec>| {
+        let h = hash(record.eid);
+        let index = (h >> shift) as usize;
+        if buckets_ref[index / 64][1] & (1u64 << (index % 64)) == 0 {
+            emit(&record, out);
+            return;
+        }
+        let mut slot = (h >> table_shift) as usize;
+        loop {
+            match winners[slot] {
+                None => {
+                    winners[slot] = Some((record, batch_index));
+                    break;
+                }
+                Some((previous, owner)) if previous.eid == record.eid
+                    && parts[owner].opaque_id(previous.opaque_index) == parts[batch_index].opaque_id(record.opaque_index) => {
+                    if record.ingest < previous.ingest {
+                        winners[slot] = Some((record, batch_index));
+                    }
+                    break;
+                }
+                Some(_) => slot = (slot + 1) & (capacity - 1),
+            }
         }
     };
     // Identity lookups are random reads of a large table; prefetch a fixed distance ahead.
     const AHEAD: usize = 16;
     for (batch_index, batch) in parts.iter().enumerate() {
+        for run in batch.compact.runs(p) {
+            for (i, record) in run.iter().enumerate() {
+                if let Some(next) = run.get(i + AHEAD) {
+                    lm.prefetch(next.user);
+                }
+                let index = (hash(record.eid) >> shift) as usize;
+                if buckets_ref[index / 64][1] & (1u64 << (index % 64)) == 0 {
+                    if record.user != 0 {
+                        let person = lm.get(record.user);
+                        out.push(part2(person), PRec { person, ts: record.ts, pc: 0 });
+                    }
+                    continue;
+                }
+                consider(record.full(), batch_index, out);
+            }
+        }
         for run in batch.records.runs(p) {
             for (i, record) in run.iter().enumerate() {
                 if let Some(next) = run.get(i + AHEAD) {
                     lm.prefetch(next.user);
                 }
-                let h = hash(record.eid);
-                let index = (h >> shift) as usize;
-                if scratch.buckets[index / 64][1] & (1u64 << (index % 64)) == 0 {
-                    emit(record);
-                    continue;
-                }
-                let mut slot = (h >> table_shift) as usize;
-                loop {
-                    match scratch.winners[slot] {
-                        None => {
-                            scratch.winners[slot] = Some((record, batch_index));
-                            break;
-                        }
-                        Some((previous, owner)) if previous.eid == record.eid
-                            && parts[owner].opaque_id(previous.opaque_index) == batch.opaque_id(record.opaque_index) => {
-                            if record.ingest < previous.ingest {
-                                scratch.winners[slot] = Some((record, batch_index));
-                            }
-                            break;
-                        }
-                        Some(_) => slot = (slot + 1) & (capacity - 1),
-                    }
-                }
+                consider(*record, batch_index, out);
             }
         }
     }
     for (winner, _) in scratch.winners.iter().flatten() {
-        emit(winner);
+        emit(winner, out);
     }
 }
 
@@ -2005,7 +2101,7 @@ struct Ses {
 struct CItem<'a> {
     ts: u32,
     camp: u32,
-    cid: &'a [u8],
+    cid: Fid<'a>,
 }
 
 #[derive(Default)]
@@ -2143,7 +2239,7 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
         acc += x;
     }
     sc.citems.clear();
-    sc.citems.resize(nc, CItem { ts: 0, camp: 0, cid: &[] });
+    sc.citems.resize(nc, CItem { ts: 0, camp: 0, cid: Fid::new(&[]) });
     {
         let mut cur: Vec<u32> = sc.ccnt[..np].to_vec();
         let mut q = 0usize;
@@ -2170,7 +2266,7 @@ fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>]
                 let mut end = i + 1;
                 let mut best = i;
                 while end < group.len() && group[end].ts == ts {
-                    if group[end].cid < group[best].cid { best = end; }
+                    if group[end].cid.get() < group[best].cid.get() { best = end; }
                     end += 1;
                 }
                 group.swap(i, best);
@@ -2554,6 +2650,7 @@ fn main() {
             parse_events(&ctx,&ex,&mut dc,ev_maps[fi],b,e,&mut evp);
         }
         evp.wc.finish(&mut evp.records);
+        evp.wc2.finish(&mut evp.compact);
         let ids = std::sync::LazyLock::force(&lm);
         loop {
             let k = cl_next.fetch_add(1, AO::Relaxed);
@@ -2587,6 +2684,7 @@ fn main() {
                 // this partition's event blocks are free now: recycle them for the output
                 for b in ev_parts.iter() {
                     unsafe { (*(&b.records as *const Parts<EvRec> as *mut Parts<EvRec>)).release(p, out.pool) };
+                    unsafe { (*(&b.compact as *const Parts<Ev24> as *mut Parts<Ev24>)).release(p, out.pool) };
                 }
             }
             wc.finish(&mut out);
