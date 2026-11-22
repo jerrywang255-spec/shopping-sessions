@@ -1,0 +1,60 @@
+name: Validate opaque IDs against current scorer data
+on:
+  push:
+    branches: ["optimization/compact-users-qualification"]
+  workflow_dispatch:
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {seed: 519, events: 20000000, clicks: 5000000}
+          - {seed: 881, events: 60000000, clicks: 15000000}
+    env:
+      SEED: ${{ matrix.seed }}
+      EVENTS: ${{ matrix.events }}
+      CLICKS: ${{ matrix.clicks }}
+      NCPU: 8
+      DATA_DIR: /tmp/held-out
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Build shipping Dockerfiles and test event-key boundaries
+        run: |
+          mkdir -p variants src /tmp/image-baseline /tmp/image-candidate
+          cp main.rs pq.rs src/
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --offline
+          git archive 9ae37694e47da54dc185918e4251140baeab8123 | tar -x -C /tmp/image-baseline
+          git archive 941ff42f470f699a72a5cc71d9e6868bb122b825 | tar -x -C /tmp/image-candidate
+          for name in baseline candidate; do
+            docker build -q -t "ss-$name" "/tmp/image-$name"
+            cid=$(docker create "ss-$name")
+            docker cp "$cid:/app/ss" "variants/$name"
+            docker rm "$cid"
+          done
+      - name: Check official fixtures and dev answers on the release candidate
+        run: |
+          python3 -m pip install --user pyarrow==23.0.0 polars
+          url=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for archive in starter-duckdb dev-answer generator; do
+            curl -fsSL --retry 3 "$url/$archive.zip" -o "/tmp/$archive.zip"
+            unzip -q "/tmp/$archive.zip" -d /tmp
+          done
+          for threads in 1 8; do
+            NCPU="$threads" python3 /tmp/starter-duckdb/scripts/run_fixtures.py /tmp/starter-duckdb/fixtures -- variants/candidate
+          done
+          echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  /tmp/generator.zip' | sha256sum -c
+          cargo build --manifest-path /tmp/generator/Cargo.toml --release --offline
+          /tmp/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          mkdir -m 777 -p /tmp/answers
+          docker run --rm --read-only --network none -e NCPU=8 -v /tmp/dev:/data:ro -v /tmp/answers:/output ss-candidate
+          python3 /tmp/starter-duckdb/scripts/compare.py /tmp/answers /tmp/dev-answer
+      - name: Generate the full dataset and compare six interleaved pairs
+        run: |
+          /tmp/generator/target/release/generate --seed "$SEED" --events "$EVENTS" --clicks "$CLICKS" --output "$DATA_DIR"
+          python3 experiments/compare_scorer5.py
