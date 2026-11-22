@@ -569,7 +569,7 @@ mod intern_tests {
         let ids = [
             &b"e00112233445566778899aabbccddeeff"[..],
             &b"e00112233445566778899aabbccddeefF"[..],
-            "id-Î»".as_bytes(),
+            "id-ÃŽÂ»".as_bytes(),
         ];
         for (index, id) in ids.iter().enumerate() {
             assert_eq!(shard.intern(42, id), index);
@@ -1243,9 +1243,9 @@ struct PRec {
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct CRec {
+struct CRec<'a> {
     person: u64,
-    cid: u64,
+    cid: &'a [u8],
     ts: u32,
     camp: u32,
 }
@@ -1378,15 +1378,15 @@ fn parse_links(ex: &Exotic, m: &[u8], b: usize, e: usize, out: &mut Vec<(u64, u6
 }
 
 // ------------------------------------------------------------------ stage 2: dedup
-fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &[u8], b: usize, e: usize, out: &mut Parts<CRec>) {
+fn parse_clicks_direct<'a>(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache, m: &'a [u8], b: usize, e: usize, out: &mut Parts<CRec<'a>>) {
     let base = ctx.base;
     let hi = ctx.we;
     let lim = m.as_ptr() as usize + m.len();
     // Identity lookups wait in a short FIFO so their table slots can be prefetched first.
     const AHEAD: usize = 16;
-    let mut ring = [CRec { person: 0, cid: 0, ts: 0, camp: 0 }; AHEAD];
+    let mut ring = [CRec { person: 0, cid: &[], ts: 0, camp: 0 }; AHEAD];
     let mut queued = 0usize;
-    let mut resolve = |r: CRec, out: &mut Parts<CRec>| {
+    let resolve = |r: CRec<'a>, out: &mut Parts<CRec<'a>>| {
         let person = lm.get(r.person);
         out.push(part2(person), CRec { person, ..r });
     };
@@ -1402,7 +1402,8 @@ fn parse_clicks_direct(ctx: &Ctx, ex: &Exotic, lm: &LinkMap, dc: &mut DateCache,
             Some(c) => c as u32,
             None => return,
         };
-        let cid = ex.key_in(f[0], lim);
+        // Click IDs only break timestamp ties. Keep the original unquoted field.
+        let cid = f[0];
         let user = ex.key_in(f[1], lim);
         lm.prefetch(user);
         let slot = queued % AHEAD;
@@ -1510,21 +1511,21 @@ struct Ses {
 }
 
 #[derive(Clone, Copy)]
-struct CItem {
+struct CItem<'a> {
     ts: u32,
     camp: u32,
-    cid: u64,
+    cid: &'a [u8],
 }
 
 #[derive(Default)]
-struct Scratch {
+struct Scratch<'a> {
     table: Vec<u32>,
     persons: Vec<u64>,
     lidx: Vec<u32>,
     cnt: Vec<u32>,
     items: Vec<u64>,
     ccnt: Vec<u32>,
-    citems: Vec<CItem>,
+    citems: Vec<CItem<'a>>,
     ses: Vec<Ses>,
     cbuf: Vec<(u32, u32)>,
     ctmp: Vec<(u32, u32)>,
@@ -1532,7 +1533,7 @@ struct Scratch {
     day_end: Vec<usize>,
 }
 
-fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<CRec>], p: usize, sc: &mut Scratch, agg: &mut Agg) {
+fn process_partition<'a>(ctx: &Ctx, evs: &[Parts<PRec>], cls: &[Parts<CRec<'a>>], p: usize, sc: &mut Scratch<'a>, agg: &mut Agg) {
     let n: usize = evs.iter().map(|t| t.count(p)).sum();
     if n == 0 {
         return;
@@ -1649,7 +1650,7 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
         acc += x;
     }
     sc.citems.clear();
-    sc.citems.resize(nc, CItem { ts: 0, camp: 0, cid: 0 });
+    sc.citems.resize(nc, CItem { ts: 0, camp: 0, cid: &[] });
     {
         let mut cur: Vec<u32> = sc.ccnt[..np].to_vec();
         let mut q = 0usize;
@@ -1676,7 +1677,7 @@ fn process_partition(ctx: &Ctx, ex: &Exotic, evs: &[Parts<PRec>], cls: &[Parts<C
                 let mut end = i + 1;
                 let mut best = i;
                 while end < group.len() && group[end].ts == ts {
-                    if ex.cmp(group[end].cid, group[best].cid) == Ordering::Less { best = end; }
+                    if group[end].cid < group[best].cid { best = end; }
                     end += 1;
                 }
                 group.swap(i, best);
@@ -2034,7 +2035,7 @@ fn main() {
                         if k >= P2 {
                             break;
                         }
-                        process_partition(ctx, ex, pe_parts, pc_parts, order[k].1, &mut sc, &mut agg);
+                        process_partition(ctx, pe_parts, pc_parts, order[k].1, &mut sc, &mut agg);
                     }
                     if t == 0 || !agg.rows.is_empty() {
                         write_user_daily(&ud_dir.join(format!("part-{:03}.parquet", t)), &agg.rows, ex, cats);
